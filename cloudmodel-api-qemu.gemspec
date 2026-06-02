@@ -18,6 +18,6 @@ Gem::Specification.new do |spec|
   spec.files = Dir["{app,config,lib}/**/*", "MIT-LICENSE", "Rakefile", "README.md"]
 
   spec.add_dependency "rails",      "~> 8.0"
-  spec.add_dependency "cloudmodel", "~> 0.3.0"
+  spec.add_dependency "cloudmodel", "~> 0.4.0"
   spec.add_dependency "net-ssh",    ">= 7.0"
 end
