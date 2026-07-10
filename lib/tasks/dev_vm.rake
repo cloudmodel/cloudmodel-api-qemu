@@ -110,11 +110,11 @@ namespace :dev do
     puts "  private_network : #{private_ip}/25  (gateway: #{private_gateway})"
     puts ""
 
+    # system_disks is set by create_vm! (vdb, vdc, … — vda is the rescue disk)
     host = CloudModel::Host.new(
       name:            name,
       primary_address: { ip: primary_ip,  subnet: 24, gateway: primary_gateway },
-      private_network: { ip: private_ip,  subnet: 25, gateway: private_gateway },
-      system_disks:    vm_cfg.disk_count.times.map { |i| "vd#{('a'.ord + i).chr}" }
+      private_network: { ip: private_ip,  subnet: 25, gateway: private_gateway }
     )
     host.addresses.build(ip: guest_subnet, subnet: 24, gateway: guest_gateway)
 
@@ -124,5 +124,66 @@ namespace :dev do
     # ── Provision VM ─────────────────────────────────────────────────────────
     puts "Provisioning VM (extra_ips: #{extra_ips})..."
     host.create_vm!(extra_ips: extra_ips)
+  end
+
+  namespace :vm do
+    def find_vm_host(name)
+      abort "Usage: rake dev:vm:<task>[name]" if name.nil? || name.strip.empty?
+      CloudModel::Host.where(name: name.strip).first or abort "No host named '#{name}'"
+    end
+
+    desc "Alias for dev:create_vm_host"
+    task :create, [:name, :extra_ips] => ['dev:create_vm_host']
+
+    desc "List all hosts with their VM state"
+    task list: :environment do
+      hosts = CloudModel::Host.all.to_a
+      if hosts.empty?
+        puts "No hosts defined. Create one with: rake dev:create_vm_host"
+        next
+      end
+      hosts.each do |host|
+        s = host.vm_status
+        state = s[:running] ? "RUNNING (pid #{s[:pid]})" : "stopped"
+        puts format("%-12s %-15s ssh 127.0.0.1:%-6s %s", host.name, s[:ip], s[:ssh_port], state)
+      end
+    end
+
+    desc "Start a stopped VM"
+    task :start, [:name] => [:environment] do |_, args|
+      find_vm_host(args[:name]).start_vm!
+    end
+
+    desc "Gracefully stop a VM (ACPI power-off)"
+    task :stop, [:name] => [:environment] do |_, args|
+      find_vm_host(args[:name]).stop_vm!
+    end
+
+    desc "Force-kill a VM (like pulling the power)"
+    task :kill, [:name] => [:environment] do |_, args|
+      find_vm_host(args[:name]).kill_vm!
+    end
+
+    desc "Destroy a VM's disks and state files (keeps the Host document)"
+    task :destroy, [:name] => [:environment] do |_, args|
+      find_vm_host(args[:name]).destroy_vm!
+    end
+
+    desc "Destroy a VM and delete its Host document"
+    task :purge, [:name] => [:environment] do |_, args|
+      host = find_vm_host(args[:name])
+      host.destroy_vm!
+      host.delete
+      puts "Host '#{host.name}' deleted."
+    end
+
+    desc "Print the SSH command for a VM"
+    task :ssh, [:name] => [:environment] do |_, args|
+      host = find_vm_host(args[:name])
+      s = host.vm_status
+      puts "ssh -i #{CloudModel.config.data_directory}/keys/id_rsa -p #{s[:ssh_port]} root@127.0.0.1"
+      puts "# or via ~/.ssh/config mapping:"
+      puts "ssh root@#{s[:ip]}"
+    end
   end
 end

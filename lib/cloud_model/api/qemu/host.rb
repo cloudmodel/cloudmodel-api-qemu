@@ -11,6 +11,10 @@ module CloudModel
           base.field :vm_disk_paths, type: Array, default: []
           base.field :vm_pid_path,   type: String
           base.field :vm_extra_nics, type: Integer, default: 0
+          # true: boot the Debian rescue disk (vda) — initial provisioning.
+          # false: boot the installed system from the system disks (EDK2 has no
+          # persistent NVRAM here, so boot order is controlled by what is attached).
+          base.field :vm_boot_rescue, type: Mongoid::Boolean, default: true
         end
 
         # Create disk images, boot the live ISO, bootstrap SSH and packages,
@@ -47,6 +51,11 @@ module CloudModel
         # @return [Boolean] true when the QEMU process is running
         def vm_running?
           CloudModel::Api::Qemu::Server.new(self).running?
+        end
+
+        # @return [Hash] state snapshot (:running, :pid, :ip, :ssh_port, :disks, :vm_dir)
+        def vm_status
+          CloudModel::Api::Qemu::Server.new(self).status
         end
       end
     end

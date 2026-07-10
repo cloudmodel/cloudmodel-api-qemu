@@ -6,16 +6,19 @@ Gem::Specification.new do |spec|
   spec.authors     = ["Sven G. Brönstrup (StarPeak)"]
   spec.email       = ["info@cloud-model.org"]
   spec.homepage    = "http://cloud-model.org/"
-  spec.summary     = "Local QEMU/VM support for CloudModel"
-  spec.description = "Provision and manage local QEMU virtual machines as CloudModel hosts. " \
-                     "Boots a Debian live ISO, bootstraps SSH, and registers the VM as a " \
-                     "CloudModel::Host — useful for development and CI environments."
+  spec.summary     = "QEMU virtual server emulation to test CloudModel actions locally"
+  spec.description = "Emulates virtual servers with QEMU so CloudModel host and guest " \
+                     "deploys can be exercised end-to-end on a workstation — no real " \
+                     "hardware needed. Provisions VMs with a Debian rescue system, " \
+                     "registers them as CloudModel hosts, emulates NVMe disks with SMART " \
+                     "data, and adapts CloudModel's workers to the QEMU environment " \
+                     "(UEFI boot, user-mode NAT networking). For development and CI."
   spec.license     = "MIT"
 
   spec.metadata["homepage_uri"]    = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/cloudmodel/cloudmodel-api-qemu"
 
-  spec.files = Dir["{app,config,lib}/**/*", "MIT-LICENSE", "Rakefile", "README.md"]
+  spec.files = Dir["{app,config,lib}/**/*", "LICENSE", "Rakefile", "README.md"]
 
   spec.add_dependency "rails",      "~> 8.0"
   spec.add_dependency "cloudmodel", "~> 0.4.0"

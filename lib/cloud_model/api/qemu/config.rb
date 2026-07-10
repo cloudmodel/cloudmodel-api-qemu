@@ -11,17 +11,17 @@ module CloudModel
           @vm_dir || File.join(CloudModel.config.data_directory, 'vms')
         end
 
-        # Path to the cached Alpine base image (qcow2).
+        # Path to the cached Debian genericcloud base image (qcow2).
         # Shared across all VMs — never modified in place.
         attr_writer :base_image_path
         def base_image_path
-          @base_image_path || File.join(vm_dir, 'alpine-base.qcow2')
+          @base_image_path || File.join(vm_dir, 'debian-base.qcow2')
         end
 
-        # Download URL for the Alpine genericcloud image.
-        # Leave nil (default) to auto-detect the latest release from the Alpine CDN.
+        # Download URL for the Debian genericcloud image.
+        # Defaults to the latest Debian bookworm genericcloud qcow2 for the current arch.
         # Override if you need a specific version or a local mirror:
-        #   config.api.qemu.base_image_url = "https://mirror.example.com/alpine-virt-3.21.3-r0-aarch64.qcow2"
+        #   config.api.qemu.base_image_url = "https://mirror.example.com/debian-12-genericcloud-amd64.qcow2"
         attr_accessor :base_image_url
 
         # Disk image size for new system disks (qemu-img format, e.g. "80G")
@@ -71,7 +71,7 @@ module CloudModel
 
         # Number of system disk images to create (1 = single disk / degraded RAID,
         # 2 = full RAID-1 like a real server).
-        # The rescue disk (Alpine) is additional and not counted here.
+        # The rescue disk (Debian) is additional and not counted here.
         attr_accessor :disk_count
         def disk_count
           @disk_count || 2
