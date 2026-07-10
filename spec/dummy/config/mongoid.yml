@@ -1,0 +1,8 @@
+test:
+  clients:
+    default:
+      database: cloudmodel_api_qemu_test
+      hosts:
+        - localhost:27017
+      options:
+        server_selection_timeout: 2

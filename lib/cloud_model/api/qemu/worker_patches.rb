@@ -27,13 +27,19 @@ module CloudModel
         end
 
         module HostPatch
+          # A host counts as local VM when the QEMU host mixin gave it disk
+          # image paths. All overrides below are no-ops for real hardware.
+          def vm_host?
+            respond_to?(:vm_disk_paths) and vm_disk_paths.present?
+          end
+
           # Host#ssh_address returns ssh_connection.host, which Net::SSH has
           # already resolved via ~/.ssh/config to 127.0.0.1 — but WITHOUT the
           # forwarded port.  scp/rsync commands built from it would hit
           # 127.0.0.1:22.  Returning the primary IP lets the ssh CLI resolve
           # the ~/.ssh/config mapping (HostName + Port) itself.
           def ssh_address
-            if respond_to?(:vm_disk_paths) and vm_disk_paths.present?
+            if vm_host?
               primary_address.ip
             else
               super
@@ -47,7 +53,7 @@ module CloudModel
           # dropped and the VM is locked out until the next reboot.
           def restart_firewall
             ret = super
-            if respond_to?(:vm_disk_paths) and vm_disk_paths.present?
+            if vm_host?
               exec %{IFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}'); DHCP_IP=$(ip -4 -o addr show dev "$IFACE" scope global | awk '{print $4}' | cut -d/ -f1); [ -n "$DHCP_IP" ] && { iptables -t nat -C PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{primary_address.ip} 2>/dev/null || iptables -t nat -A PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{primary_address.ip}; }}
             end
             ret
@@ -57,7 +63,7 @@ module CloudModel
           # is not routable from the workstation, so every connection would
           # first burn the 15s connect timeout before falling back.
           def ssh_connection
-            if respond_to?(:vm_disk_paths) and vm_disk_paths.present? and initial_root_pw.blank?
+            if vm_host? and initial_root_pw.blank?
               @ssh_connection ||= Net::SSH.start(primary_address.ip, 'root',
                 keys: ["#{CloudModel.config.data_directory}/keys/id_rsa"],
                 keys_only: true,

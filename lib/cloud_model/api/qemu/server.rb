@@ -316,15 +316,23 @@ module CloudModel
         end
 
         def create_cloud_init_seed(macs)
+          log "Creating cloud-init seed..."
+          args = [cloud_init_meta_data, cloud_init_user_data, cloud_init_network_config(macs)]
+          macos? ? create_seed_macos(*args) : create_seed_linux(*args)
+        end
+
+        def cloud_init_meta_data
+          "instance-id: #{@host.name}\nlocal-hostname: #{@host.name}\n"
+        end
+
+        # Root password login stays enabled: CloudModel::Host#ssh_connection
+        # authenticates with initial_root_pw (password) as long as it is set —
+        # exactly like a Hetzner rescue system.  The CloudModel pubkey is
+        # installed additionally for wait_for_ssh and manual access.
+        def cloud_init_user_data
           pubkey = File.read("#{CloudModel.config.data_directory}/keys/id_rsa.pub").strip
 
-          meta_data = "instance-id: #{@host.name}\nlocal-hostname: #{@host.name}\n"
-
-          # Root password login stays enabled: CloudModel::Host#ssh_connection
-          # authenticates with initial_root_pw (password) as long as it is set —
-          # exactly like a Hetzner rescue system.  The CloudModel pubkey is
-          # installed additionally for wait_for_ssh and manual access.
-          user_data = <<~YAML
+          <<~YAML
             #cloud-config
             disable_root: false
             ssh_pwauth: true
@@ -344,17 +352,19 @@ module CloudModel
               - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
               - systemctl restart ssh
           YAML
+        end
 
-          # QEMU user-mode NAT always provides DHCP on its own 10.0.2.0/24 subnet
-          # with 10.0.2.2 as the gateway.  A static IP from the CloudModel address
-          # pool is not routable inside the NAT and prevents package installation.
-          # The VM's real primary_address is only relevant outside the VM (loopback
-          # alias + hostfwd on the host), so let DHCP handle the guest side.
-          #
-          # NICs are matched by MAC address — the kernel's predictable interface
-          # names (enp0s1, …) vary by machine type, so matching by name would
-          # leave the interface unconfigured and boot hang in networkd-wait-online.
-          network_config = {
+        # QEMU user-mode NAT always provides DHCP on its own 10.0.2.0/24 subnet
+        # with 10.0.2.2 as the gateway.  A static IP from the CloudModel address
+        # pool is not routable inside the NAT and prevents package installation.
+        # The VM's real primary_address is only relevant outside the VM (loopback
+        # alias + hostfwd on the host), so let DHCP handle the guest side.
+        #
+        # NICs are matched by MAC address — the kernel's predictable interface
+        # names (enp0s1, …) vary by machine type, so matching by name would
+        # leave the interface unconfigured and boot hang in networkd-wait-online.
+        def cloud_init_network_config(macs)
+          {
             'version' => 1,
             'config'  => macs.each_with_index.map do |mac, i|
               {
@@ -365,10 +375,6 @@ module CloudModel
               }
             end
           }.to_yaml
-
-          log "Creating cloud-init seed..."
-          macos? ? create_seed_macos(meta_data, user_data, network_config)
-                 : create_seed_linux(meta_data, user_data, network_config)
         end
 
         def create_seed_macos(meta_data, user_data, network_config)
