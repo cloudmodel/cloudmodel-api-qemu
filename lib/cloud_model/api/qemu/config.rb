@@ -25,19 +25,19 @@ module CloudModel
         attr_accessor :base_image_url
 
         # Disk image size for new system disks (qemu-img format, e.g. "80G")
-        attr_accessor :disk_size
+        attr_writer :disk_size
         def disk_size
           @disk_size || '80G'
         end
 
         # RAM in MB
-        attr_accessor :ram
+        attr_writer :ram
         def ram
           @ram || 4096
         end
 
         # Number of vCPUs
-        attr_accessor :cpus
+        attr_writer :cpus
         def cpus
           @cpus || 2
         end
@@ -64,7 +64,7 @@ module CloudModel
         end
 
         # Root password set on the rescue VM and stored as initial_root_pw.
-        attr_accessor :root_password
+        attr_writer :root_password
         def root_password
           @root_password || 'rescue'
         end
@@ -72,13 +72,13 @@ module CloudModel
         # Number of system disk images to create (1 = single disk / degraded RAID,
         # 2 = full RAID-1 like a real server).
         # The rescue disk (Debian) is additional and not counted here.
-        attr_accessor :disk_count
+        attr_writer :disk_count
         def disk_count
           @disk_count || 2
         end
 
         # Seconds to wait for SSH after VM boot before giving up.
-        attr_accessor :boot_timeout
+        attr_writer :boot_timeout
         def boot_timeout
           @boot_timeout || 300
         end

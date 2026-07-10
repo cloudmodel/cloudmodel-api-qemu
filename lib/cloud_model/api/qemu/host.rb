@@ -17,8 +17,8 @@ module CloudModel
           base.field :vm_boot_rescue, type: Mongoid::Boolean, default: true
         end
 
-        # Create disk images, boot the live ISO, bootstrap SSH and packages,
-        # then populate primary_address, addresses, and initial_root_pw.
+        # Create disk images, boot the rescue disk, bootstrap SSH and packages,
+        # then populate system_disks and initial_root_pw on the Host document.
         #
         # @param options [Hash]
         # @option options [Integer] :extra_ips  Number of additional IP addresses

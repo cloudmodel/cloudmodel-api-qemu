@@ -12,8 +12,9 @@ module CloudModel
       #
       # Boot model:
       #   Each VM has a small Debian genericcloud rescue disk (cloned from a shared
-      #   base image) as vda, plus disk_count empty system disks (vdb, vdc, …) for
-      #   CloudModel to partition and install Debian onto.
+      #   base image) as vda, plus disk_count empty system disks attached as
+      #   emulated NVMe (nvme0n1, …) for CloudModel to partition and install
+      #   Debian onto.
       #
       #   A cloud-init NoCloud seed image (FAT, labeled CIDATA) is attached as
       #   the last virtio device.  It pre-configures SSH (CloudModel key), root
@@ -262,11 +263,11 @@ module CloudModel
 
         # ── Disk images ─────────────────────────────────────────────────────────
         # Layout:
-        #   vda  rescue_disk  — Debian rescue system (CoW clone of base image)
-        #   vdb  disk1.qcow2  — empty system disk 1 (for CloudModel to install Debian)
-        #   vdc  disk2.qcow2  — empty system disk 2 (RAID mirror)
+        #   vda      rescue_disk  — Debian rescue system (CoW clone of base image)
+        #   nvme0n1  disk1.qcow2  — empty system disk 1 (for CloudModel's install)
+        #   nvme1n1  disk2.qcow2  — empty system disk 2 (RAID mirror)
         #   …
-        # system_disks in the Host document maps to vdb, vdc, …
+        # system_disks in the Host document maps to nvme0n1, nvme1n1, …
 
         def vm_dir
           File.join(@cfg.vm_dir, @host.name)

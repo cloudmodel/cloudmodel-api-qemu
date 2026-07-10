@@ -10,8 +10,14 @@ Each VM mimics a bare-metal server the way CloudModel expects to find it:
   base image), analogous to a Hetzner rescue system: root login with the
   configured `initial_root_pw` **and** the CloudModel SSH key, `sgdisk`,
   `mdadm`, `parted`, `debootstrap` preinstalled via cloud-init.
-- **vdb, vdc, …** — empty system disks (`disk_count`, default 2) for CloudModel
-  to partition, RAID and install onto (`host.system_disks`).
+- **nvme0n1, nvme1n1, …** — empty system disks (`disk_count`, default 2) for
+  CloudModel to partition, RAID and install onto (`host.system_disks`).
+  Attached as emulated NVMe: `smartmontools` sees a real SMART/health log, so
+  disk monitoring works like on hardware, and the device names stay stable
+  when the rescue disk is detached for the installed-system boot.
+- Sensors and CPU model name (which QEMU cannot emulate) are faked at the
+  OS level inside the VM (`/usr/local/bin/sensors`, `lscpu` wrapper), keeping
+  CloudModel's monitoring plugins unmodified.
 
 ## Networking model
 
@@ -24,10 +30,12 @@ QEMU user-mode NAT (`-netdev user`) — no root, no bridge, no DHCP server neede
   `Net::SSH`/CloudModel — work transparently.
 - Optionally a loopback alias for the IP is added (`sudo`, best effort).
 
-**Limitation:** only SSH (port 22) is forwarded. Deployed network configuration
-with static IPs from the CloudModel address pool will not be reachable after a
-reboot into the installed system — full host deploys need a bridged/vmnet setup
-(not implemented yet).
+Full host deploys work: worker patches switch the installed system to DHCP on
+QEMU's NAT, DNAT incoming hostfwd traffic to the host's `primary_address` (so
+CloudModel's firewall rules apply as on real hardware, restored after firewall
+restarts), and boot the installed system via UEFI/grub-efi once the deploy
+finishes. **Limitation:** only SSH (port 22) is forwarded from the outside;
+other services on the VM are reachable from within the VM/guests only.
 
 ## Setup
 
@@ -86,4 +94,4 @@ instead of running headless (log: `<vm_dir>/qemu.log`).
 
 ## License
 
-MIT — see MIT-LICENSE.
+MIT — see [LICENSE](LICENSE).
