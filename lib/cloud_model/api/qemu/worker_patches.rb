@@ -54,7 +54,10 @@ module CloudModel
           def restart_firewall
             ret = super
             if vm_host?
-              exec %{IFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}'); DHCP_IP=$(ip -4 -o addr show dev "$IFACE" scope global | awk '{print $4}' | cut -d/ -f1); [ -n "$DHCP_IP" ] && { iptables -t nat -C PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{primary_address.ip} 2>/dev/null || iptables -t nat -A PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{primary_address.ip}; }}
+              # Find the NAT NIC by its user-mode-NAT DHCP address (10.0.2.x) —
+              # not "first non-lo", which with socket_vmnet would wrongly pick the
+              # vmnet eth0. Restore the hostfwd → primary DNAT on it.
+              exec %{DHCP_IP=$(ip -4 -o addr show | awk '$4 ~ /^10\\.0\\.2\\./ {print $4; exit}' | cut -d/ -f1); [ -n "$DHCP_IP" ] && { iptables -t nat -C PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{primary_address.ip} 2>/dev/null || iptables -t nat -A PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{primary_address.ip}; }}
             end
             ret
           end
@@ -94,6 +97,23 @@ module CloudModel
 
         module HostWorkerPatch
           include VmHostCheck
+
+          # The RAID-1 initial resync mirrors every block — on sparse qcow2
+          # images that materializes the FULL partition sizes on the
+          # workstation disk (~180G per VM for nothing). The disks are
+          # brand-new and identical (all zeros), so skip the resync.
+          def init_raid_device md_data, md
+            return super unless vm_host?
+
+            if md_data =~ /#{md[:device]} \: active raid1/
+              comment_sub_step "Skip RAID device #{md[:device]} for #{md[:name]}, as already active", indent: 4
+            else
+              comment_sub_step "Init RAID device #{md[:device]} for #{md[:name]} (no resync on fresh sparse images)", indent: 4
+              devs = @host.system_disks.map{|dev| "/dev/#{disk_partition_device dev, md[:partition]}"}
+              @host.exec "mdadm --zero-superblock #{devs * ' '}"
+              @host.exec "mdadm --create -e1 -f --assume-clean /dev/#{md[:device]} --level=1 --raid-devices=#{devs.size} #{devs * ' '}"
+            end
+          end
 
           # virtio disks partition as vdb1, vdb2, … (no 'p' separator like nvme)
           def disk_partition_device device, number
@@ -178,12 +198,17 @@ module CloudModel
 
             comment_sub_step 'Format cloud array'
 
+            # A retry after a failed deploy leaves the arrays mounted (md4
+            # even twice: /var/lib/lxd AND /mnt/newroot/var/lib/lxd) — mkfs
+            # refuses mounted devices.
+            @host.exec 'umount --all-targets /dev/md1'
             @host.exec! 'mkfs.ext4 /dev/md1', 'Failed to create cloud filesystem'
             @host.exec 'mkdir -p /cloud'
             @host.exec! 'mount /dev/md1 /cloud', 'Failed to mount cloud filesystem'
 
             comment_sub_step 'Format lxd array'
 
+            @host.exec 'umount --all-targets /dev/md4'
             @host.exec! 'mkfs.ext4 /dev/md4', 'Failed to create lxd filesystem'
             @host.exec 'mkdir -p /var/lib/lxd'
             @host.exec! 'mount /dev/md4 /var/lib/lxd', 'Failed to mount lxd filesystem'
@@ -212,6 +237,7 @@ module CloudModel
             if vm_host?
               configure_vm_network
               configure_vm_fake_hardware
+              configure_vm_apt_cache
             end
             result
           end
@@ -278,50 +304,101 @@ module CloudModel
           private
 
           # Static primary_address networking does not work inside QEMU user-mode
-          # NAT — replace the rendered network.service with a DHCP variant and pin
-          # the NIC name to eth0 (by MAC) so the rest of the config keeps working.
+          # NAT — replace the rendered network.service with a variant matched to
+          # the QEMU NIC layout. With socket_vmnet (Config#vmnet) the vmnet NIC is
+          # the *external* interface and is named **eth0** so cloudmodel's whole
+          # eth0-based config (primary_address, guest public IPs, tinc
+          # BindToInterface, firewall) targets it natively — that is what makes
+          # cross-host guest routing work locally. The user-mode NAT NIC then
+          # becomes eth1 and carries only internet/apt (default route) and the
+          # hostfwd SSH ingress. Without vmnet the NAT NIC keeps the eth0 role and
+          # primary_address lives on lo (isolated single-host mode).
+          # Writes a systemd .link file that renames the NIC with +mac+ to +name+.
+          def write_link(path, mac, name)
+            @host.sftp.file.open(path, 'w') do |f|
+              f.write <<~LINK
+                [Match]
+                MACAddress=#{mac}
+
+                [Link]
+                Name=#{name}
+              LINK
+            end
+          end
+
           def configure_vm_network
             comment_sub_step 'Override network config for QEMU user-mode NAT (VM host)'
 
-            mac = begin
+            nat_mac = begin
               File.read(File.join(CloudModel.config.api.qemu.vm_dir, @host.name, 'macs.txt')).split("\n").first.to_s.strip
             rescue
               nil
             end
 
-            if mac.present?
-              mkdir_p "#{root}/etc/systemd/network"
-              @host.sftp.file.open("#{root}/etc/systemd/network/10-eth0.link", 'w') do |f|
-                f.write <<~LINK
-                  [Match]
-                  MACAddress=#{mac}
+            vmnet     = CloudModel.config.api.qemu.vmnet
+            vmnet_mac = CloudModel::Api::Qemu.vmnet_mac(@host.primary_address.ip) if vmnet
+            # The external interface (eth0) is the vmnet NIC when socket_vmnet is
+            # used, otherwise the NAT NIC.
+            ext_mac   = vmnet ? vmnet_mac : nat_mac
 
-                  [Link]
-                  Name=eth0
-                LINK
+            mkdir_p "#{root}/etc/systemd/network"
+            write_link "#{root}/etc/systemd/network/10-eth0.link", ext_mac, 'eth0' if ext_mac
+            # NAT NIC is the secondary interface (eth1) only when vmnet took eth0.
+            write_link "#{root}/etc/systemd/network/10-eth1.link", nat_mac, 'eth1' if vmnet && nat_mac
+
+            # Guest public IPs cloudmodel would put on eth0 (network_service.erb) —
+            # so peers and the workstation reach the guests over the vmnet segment.
+            ext_ips = []
+            if vmnet
+              @host.addresses.each do |address|
+                next unless address.ip_version == 4
+                address.list_ips.each { |ip| ext_ips << "#{ip}/#{address.subnet}" }
               end
             end
 
-            # The script picks the first non-lo interface at runtime instead of
-            # hardcoding eth0: the .link rename only applies when the initramfs
-            # udev sees it — too fragile to depend on for reaching the box.
             mkdir_p "#{root}/usr/local/sbin"
             @host.sftp.file.open("#{root}/usr/local/sbin/vm-network.sh", 'w') do |f|
               f.write <<~SCRIPT
                 #!/bin/sh
-                # QEMU VM network setup (cloudmodel-api-qemu): DHCP on the first NIC.
-                IFACE=$(ip -o link show | awk -F': ' '$2 != "lo" {print $2; exit}')
-                ip link set "$IFACE" up
-                dhclient -4 -pf "/run/dhclient.$IFACE.pid" "$IFACE"
-                # The CloudModel primary_address only exists outside the VM
-                # (loopback alias + hostfwd on the workstation). Add it on lo so
-                # local services can bind to it.
-                ip addr add #{@host.primary_address.ip}/32 dev lo 2>/dev/null || true
+                # QEMU VM network setup (cloudmodel-api-qemu). NICs are found by their
+                # fixed MACs, so this works whether or not the .link rename applied.
+                NAT_MAC="#{nat_mac}"
+                VMNET_MAC="#{vmnet_mac}"
+                nic_for() { ip -o link show | grep -i "$1" | awk -F': ' '{print $2}' | head -1; }
+                NAT=$(nic_for "$NAT_MAC")
+                VMNET=""
+                [ -n "$VMNET_MAC" ] && VMNET=$(nic_for "$VMNET_MAC")
+
+                # NAT NIC: internet/apt via user-mode NAT + the default route.
+                # Static, not DHCP — QEMU SLIRP hands out fixed addresses
+                # (guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3), so we pin
+                # them like prod does its static eth0 instead of running dhclient
+                # (which, on the wrong NIC, was fragile). This is the only NIC
+                # that carries the default route / internet.
+                ip link set "$NAT" up
+                ip addr add 10.0.2.15/24 dev "$NAT" 2>/dev/null || true
+                ip route replace default via 10.0.2.2 dev "$NAT"
+                grep -q '^nameserver 10.0.2.3' /etc/resolv.conf 2>/dev/null || echo 'nameserver 10.0.2.3' > /etc/resolv.conf
+
+                if [ -n "$VMNET" ]; then
+                  # socket_vmnet NIC = eth0 = external interface: primary_address
+                  # (real, peer-reachable /24) plus the guest public IPs.
+                  ip link set "$VMNET" up
+                  ip addr add #{@host.primary_address.ip}/24 dev "$VMNET" 2>/dev/null || true
+                  for cidr in #{ext_ips.join(' ')}; do
+                    ip addr add "$cidr" dev "$VMNET" 2>/dev/null || true
+                  done
+                else
+                  # No vmnet NIC (config.api.qemu.vmnet=false): keep primary on lo
+                  # so local services can still bind to it (single-host mode).
+                  ip addr add #{@host.primary_address.ip}/32 dev lo 2>/dev/null || true
+                fi
+
                 # CloudModel's firewall only ACCEPTs traffic addressed to the
-                # primary_address — hostfwd packets arrive on the NAT DHCP
-                # address though.  DNAT them so all firewall rules apply as on
+                # primary_address — hostfwd SSH packets arrive on the NAT DHCP
+                # address though. DNAT them so all firewall rules apply as on
                 # real hardware.
-                DHCP_IP=$(ip -4 -o addr show dev "$IFACE" scope global | awk '{print $4}' | cut -d/ -f1)
+                DHCP_IP=$(ip -4 -o addr show dev "$NAT" scope global | awk '{print $4}' | cut -d/ -f1)
                 if [ -n "$DHCP_IP" ]; then
                   iptables -t nat -C PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{@host.primary_address.ip} 2>/dev/null || \
                     iptables -t nat -A PREROUTING -d "$DHCP_IP" -p tcp -j DNAT --to-destination #{@host.primary_address.ip}
@@ -391,6 +468,23 @@ module CloudModel
             end
 
             chroot! root, "chmod 755 /usr/local/bin/sensors /usr/local/bin/lscpu", "Failed to chmod fake hardware tools"
+          end
+
+          # Route apt (conf file) and debootstrap (http_proxy env for SSH
+          # sessions) of the installed system through the workstation's
+          # package cache — see AptCache. No-op when the cache is disabled
+          # or not running.
+          def configure_vm_apt_cache
+            return unless CloudModel.config.api.qemu.apt_cache and CloudModel::Api::Qemu::AptCache.running?
+
+            comment_sub_step 'Route apt through the workstation package cache (VM host)'
+            url = CloudModel::Api::Qemu::AptCache.proxy_url
+
+            @host.sftp.file.open("#{root}/etc/apt/apt.conf.d/01cloudmodel-cache", 'w') do |f|
+              f.write %(Acquire::http::Proxy "#{url}";\n)
+            end
+            chroot! root, "grep -q '^http_proxy=' /etc/environment 2>/dev/null || echo 'http_proxy=#{url}' >> /etc/environment",
+              'Failed to set http_proxy in /etc/environment'
           end
         end
 

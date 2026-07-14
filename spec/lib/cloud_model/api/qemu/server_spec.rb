@@ -3,9 +3,11 @@ require 'tmpdir'
 
 describe CloudModel::Api::Qemu::Server do
   let(:primary_address) { double 'Address', ip: '10.66.0.3' }
+  let(:host_arch) { CloudModel::Api::Qemu::Config.workstation_arch }
   let(:host) do
     double 'Host',
       name: 'host23',
+      arch: host_arch,
       primary_address: primary_address,
       vm_disk_paths: ['/vms/host23/disk1.qcow2', '/vms/host23/disk2.qcow2']
   end
@@ -79,10 +81,70 @@ describe CloudModel::Api::Qemu::Server do
       expect(server.send(:resolve_base_image_url)).to eq 'https://mirror.example.com/img.qcow2'
     end
 
-    it 'defaults to the Debian bookworm genericcloud image for the current arch' do
+    it "defaults to the Debian bookworm genericcloud image for the HOST's arch" do
       config.instance_variable_set(:@base_image_url, nil)
       url = server.send(:resolve_base_image_url)
-      expect(url).to match %r{\Ahttps://cloud\.debian\.org/images/cloud/bookworm/latest/debian-12-genericcloud-(arm64|amd64)\.qcow2\z}
+      expect(url).to eq "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-#{host_arch}.qcow2"
+    end
+  end
+
+  describe 'architecture handling' do
+    context 'host arch matches the workstation' do
+      it 'is not cross-arch and uses hardware acceleration' do
+        expect(server.send(:cross_arch?)).to be false
+        args = server.send(:qemu_machine_args)
+        expect(args.join(' ')).to include '-cpu host'
+        expect(args).to include '-accel'
+      end
+    end
+
+    context 'host arch differs from the workstation' do
+      let(:host_arch) { CloudModel::Api::Qemu::Config.workstation_arch == 'arm64' ? 'amd64' : 'arm64' }
+
+      it 'runs fully TCG-emulated with -cpu max' do
+        expect(server.send(:cross_arch?)).to be true
+        args = server.send(:qemu_machine_args)
+        expect(args.join(' ')).to include '-cpu max'
+        expect(args).not_to include '-accel'
+      end
+
+      it 'selects the qemu binary for the VM arch' do
+        expected = host_arch == 'arm64' ? 'qemu-system-aarch64' : 'qemu-system-x86_64'
+        expect(server.send(:qemu_binary)).to eq expected
+      end
+
+      it 'selects the base image for the VM arch' do
+        config.vm_dir = '/vms'
+        expect(server.send(:base_image_path)).to eq "/vms/debian-base-#{host_arch}.qcow2"
+      end
+
+      it 'scales the boot timeout for TCG emulation' do
+        config.boot_timeout = 100
+        expect(server.send(:effective_boot_timeout)).to eq 600
+      end
+    end
+
+    it 'uses the machine type of the VM arch' do
+      args = { 'arm64' => 'virt', 'amd64' => 'q35' }
+      expect(args).to have_key host_arch
+      expect(server.send(:qemu_machine_args)).to include args[host_arch]
+    end
+
+    describe 'UEFI firmware attachment' do
+      it 'passes arm64 firmware via -bios' do
+        allow(config).to receive(:qemu_firmware).with('arm64').and_return('/fw/edk2-aarch64.fd')
+        allow(host).to receive(:arch).and_return('arm64')
+        args = server.send(:qemu_machine_args)
+        expect(args.each_cons(2)).to include ['-bios', '/fw/edk2-aarch64.fd']
+      end
+
+      it 'passes amd64 firmware as read-only pflash (code-only image)' do
+        allow(config).to receive(:qemu_firmware).with('amd64').and_return('/fw/edk2-x86_64.fd')
+        allow(host).to receive(:arch).and_return('amd64')
+        args = server.send(:qemu_machine_args)
+        expect(args.join(' ')).to include 'if=pflash,format=raw,readonly=on,file=/fw/edk2-x86_64.fd'
+        expect(args).not_to include '-bios'
+      end
     end
   end
 
@@ -99,13 +161,35 @@ describe CloudModel::Api::Qemu::Server do
 
     it 'enables root password login (Hetzner-rescue semantics) and installs the key' do
       user_data = server.send(:cloud_init_user_data)
+      expect(user_data).to start_with "#cloud-config\n"
       expect(user_data).to include 'disable_root: false'
       expect(user_data).to include 'ssh_pwauth: true'
-      expect(user_data).to include %(list: "root:#{config.root_password}")
+      expect(user_data).to match(/list: ['"]?root:#{config.root_password}/)
       expect(user_data).to include 'ssh-rsa AAAATEST comment'
       expect(user_data).to include 'PermitRootLogin yes'
       # Tools CloudModel's host deploy needs on the rescue system:
       %w(gdisk mdadm debootstrap).each { |pkg| expect(user_data).to include "- #{pkg}" }
+    end
+
+    context 'with the apt cache proxy running' do
+      before { allow(CloudModel::Api::Qemu::AptCache).to receive(:running?).and_return(true) }
+
+      it 'routes apt (conf file) and debootstrap (http_proxy env) through it' do
+        user_data = server.send(:cloud_init_user_data)
+        expect(user_data).to include '/etc/apt/apt.conf.d/01cloudmodel-cache'
+        expect(user_data).to include 'Acquire::http::Proxy "http://10.0.2.2:3142"'
+        expect(user_data).to include "echo 'http_proxy=http://10.0.2.2:3142' >> /etc/environment"
+      end
+
+      it 'stays out when disabled by config' do
+        config.apt_cache = false
+        expect(server.send(:cloud_init_user_data)).not_to include '10.0.2.2:3142'
+      end
+    end
+
+    it 'does not configure a proxy while the cache is not running' do
+      allow(CloudModel::Api::Qemu::AptCache).to receive(:running?).and_return(false)
+      expect(server.send(:cloud_init_user_data)).not_to include '10.0.2.2'
     end
 
     it 'matches NICs by MAC address and uses DHCP (user-mode NAT)' do

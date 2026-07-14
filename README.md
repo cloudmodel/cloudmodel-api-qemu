@@ -69,6 +69,7 @@ A CloudModel keypair must exist at `<data_directory>/keys/id_rsa[.pub]`.
 rake dev:create_vm_host              # auto-name (host01, host02, …)
 rake dev:create_vm_host[name]        # explicit name
 rake dev:create_vm_host[name,2]      # 1 primary + 2 extra IPs/NICs
+rake dev:create_vm_host[name,0,amd64] # explicit architecture (see below)
 
 rake dev:vm:list                     # all hosts + VM state
 rake dev:vm:start[name]
@@ -82,8 +83,32 @@ rake dev:vm:ssh[name]                # print SSH command
 From Ruby: `host.create_vm!`, `host.start_vm!`, `host.stop_vm!`, `host.kill_vm!`,
 `host.destroy_vm!`, `host.vm_running?`, `host.vm_status`.
 
+## Architectures
+
+The VM's architecture comes from `host.arch` (set on creation, default: the
+workstation's arch). A VM matching the workstation runs hardware-accelerated
+(HVF on macOS, KVM on Linux); any other arch runs fully TCG-emulated — an
+order of magnitude slower, but true to the target platform. That lets an
+arm64 workstation (Apple Silicon) exercise the production amd64 stack
+end-to-end. Base images, QEMU binary and UEFI firmware are selected per
+arch; CloudModel builds and manages templates per arch, so mixed-arch host
+fleets work — configure `config.build_host_name` as a hash
+(`{'arm64' => 'host22', 'amd64' => 'host24'}`) to pin template build hosts
+per arch (an arch without an entry builds on the deploy target itself).
+
 `QEMU_DISPLAY=1 rake dev:vm:start[name]` opens a graphical console window
 instead of running headless (log: `<vm_dir>/qemu.log`).
+
+## Package cache
+
+A small caching proxy on the workstation (started automatically with the
+first VM, `rake dev:apt_cache:status|start|stop`) serves the VMs' apt and
+debootstrap downloads from `<vm_dir>/apt-cache` — repeated template builds
+are mostly network-free, which matters double under TCG emulation. Only
+immutable pool artifacts are cached, never repository metadata. The VMs
+reach it as `http://10.0.2.2:<apt_cache_port>` (QEMU's host gateway); apt
+is configured via `apt.conf.d`, debootstrap via `http_proxy` in
+`/etc/environment`. Disable with `config.api.qemu.apt_cache = false`.
 
 ## IP allocation (dev:create_vm_host)
 

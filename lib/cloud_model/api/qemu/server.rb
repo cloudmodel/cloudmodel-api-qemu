@@ -57,6 +57,7 @@ module CloudModel
           end
 
           check_dependencies
+          AptCache.ensure_running!
           ensure_base_image
           create_disks(options[:force])
 
@@ -87,6 +88,7 @@ module CloudModel
           raise "No disk images found — run create_vm! first" if disk_paths.empty?
           macs = stored_macs
           raise "No stored MACs — cannot restart. Destroy and re-create." if macs.empty?
+          AptCache.ensure_running! # the VM's apt may be configured to use it
           ip = @host.primary_address.ip
           add_loopback_alias(ip)
           write_ssh_config(ip, vm_ssh_port(ip))
@@ -157,8 +159,8 @@ module CloudModel
 
         def check_dependencies
           candidates = [
-            ['qemu-img',       { brew: 'qemu', apt: 'qemu-utils' }],
-            [@cfg.qemu_binary, { brew: 'qemu', apt: 'qemu-system-x86 / qemu-system-arm' }],
+            ['qemu-img',  { brew: 'qemu', apt: 'qemu-utils' }],
+            [qemu_binary, { brew: 'qemu', apt: 'qemu-system-x86 / qemu-system-arm' }],
           ]
 
           missing = candidates.reject { |bin, _| which(bin) }
@@ -175,11 +177,11 @@ module CloudModel
         end
 
         def check_qemu_runnable
-          bin = `which #{@cfg.qemu_binary.shellescape}`.strip
+          bin = `which #{qemu_binary.shellescape}`.strip
           return if system("#{bin.shellescape} -version > /dev/null 2>&1")
 
           raise <<~MSG
-            #{@cfg.qemu_binary} exits immediately — the binary may have an invalid code signature.
+            #{qemu_binary} exits immediately — the binary may have an invalid code signature.
 
             Fix:
               brew reinstall qemu
@@ -196,8 +198,21 @@ module CloudModel
           RUBY_PLATFORM.include?('darwin')
         end
 
-        def arm64?
-          RbConfig::CONFIG['host_cpu'] =~ /arm|aarch64/
+        # ── Architecture ────────────────────────────────────────────────────────
+        # The VM's arch comes from the Host document (settable on creation) —
+        # matching the workstation runs hardware-accelerated (HVF/KVM), any
+        # other arch runs fully TCG-emulated (slower, but true to production).
+
+        def host_arch
+          @host.arch.presence || Config.workstation_arch
+        end
+
+        def cross_arch?
+          host_arch != Config.workstation_arch
+        end
+
+        def qemu_binary
+          @cfg.qemu_binary(host_arch)
         end
 
         def process_alive?(pid)
@@ -241,24 +256,27 @@ module CloudModel
         # Debian is used because it has apt-get, making debootstrap and package
         # installation straightforward without extra package manager detection.
 
+        def base_image_path
+          @cfg.base_image_path(host_arch)
+        end
+
         def ensure_base_image
-          return if File.exist?(@cfg.base_image_path)
-          FileUtils.mkdir_p(File.dirname(@cfg.base_image_path))
+          return if File.exist?(base_image_path)
+          FileUtils.mkdir_p(File.dirname(base_image_path))
           url = resolve_base_image_url
-          log "Downloading Debian base image to #{@cfg.base_image_path} ..."
+          log "Downloading Debian base image to #{base_image_path} ..."
           log "  URL: #{url}"
-          system("curl -L --progress-bar -o #{@cfg.base_image_path.shellescape} #{url.shellescape}") \
+          system("curl -L --progress-bar -o #{base_image_path.shellescape} #{url.shellescape}") \
             or raise "Base image download failed"
         end
 
-        # Resolves the Debian genericcloud image URL for the current architecture.
+        # Resolves the Debian genericcloud image URL for the VM's architecture.
         # If base_image_url is explicitly configured, that value is used as-is.
         # Otherwise, uses the stable bookworm genericcloud image from cloud.debian.org.
         def resolve_base_image_url
           return @cfg.base_image_url if @cfg.instance_variable_get(:@base_image_url)
 
-          arch = arm64? ? 'arm64' : 'amd64'
-          "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-#{arch}.qcow2"
+          "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-#{host_arch}.qcow2"
         end
 
         # ── Disk images ─────────────────────────────────────────────────────────
@@ -287,7 +305,7 @@ module CloudModel
           # Rescue disk: CoW clone of the shared base image (boots immediately)
           if !File.exist?(rescue_disk_path) || force
             log "Cloning Debian base image → rescue disk..."
-            system("qemu-img create -f qcow2 -b #{@cfg.base_image_path.shellescape} " \
+            system("qemu-img create -f qcow2 -b #{base_image_path.shellescape} " \
                    "-F qcow2 #{rescue_disk_path.shellescape}") \
               or raise "qemu-img clone failed for rescue disk"
           end
@@ -332,26 +350,35 @@ module CloudModel
         def cloud_init_user_data
           pubkey = File.read("#{CloudModel.config.data_directory}/keys/id_rsa.pub").strip
 
-          <<~YAML
-            #cloud-config
-            disable_root: false
-            ssh_pwauth: true
-            chpasswd:
-              list: "root:#{@cfg.root_password}"
-              expire: false
-            ssh_authorized_keys:
-              - #{pubkey}
-            packages:
-              - gdisk
-              - mdadm
-              - parted
-              - e2fsprogs
-              - dosfstools
-              - debootstrap
-            runcmd:
-              - sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-              - systemctl restart ssh
-          YAML
+          runcmds = [
+            "sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config",
+            'systemctl restart ssh'
+          ]
+
+          data = {
+            'disable_root'        => false,
+            'ssh_pwauth'          => true,
+            'chpasswd'            => { 'list' => "root:#{@cfg.root_password}", 'expire' => false },
+            'ssh_authorized_keys' => [pubkey],
+            'packages'            => %w(gdisk mdadm parted e2fsprogs dosfstools debootstrap),
+            'runcmd'              => runcmds
+          }
+
+          if apt_cache_active?
+            # apt reads the conf file; debootstrap only honors the http_proxy
+            # environment (via /etc/environment for SSH sessions).
+            data['write_files'] = [{
+              'path'    => '/etc/apt/apt.conf.d/01cloudmodel-cache',
+              'content' => %(Acquire::http::Proxy "#{AptCache.proxy_url}";\n)
+            }]
+            runcmds.unshift "echo 'http_proxy=#{AptCache.proxy_url}' >> /etc/environment"
+          end
+
+          "#cloud-config\n" + data.to_yaml.sub(/\A---\n/, '')
+        end
+
+        def apt_cache_active?
+          @cfg.apt_cache and AptCache.running?
         end
 
         # QEMU user-mode NAT always provides DHCP on its own 10.0.2.0/24 subnet
@@ -435,19 +462,36 @@ module CloudModel
 
         # ── QEMU command ─────────────────────────────────────────────────────────
 
+        # Machine type, CPU and acceleration for the VM's architecture:
+        # native arch → -cpu host with HVF (macOS) / KVM (Linux); foreign
+        # arch → full TCG emulation with -cpu max (no accel flag). UEFI
+        # firmware is required on both archs — the installed systems boot
+        # via grub-efi --removable.
+        def qemu_machine_args
+          args = ['-M', host_arch == 'arm64' ? 'virt' : 'q35']
+
+          if cross_arch?
+            args += ['-cpu', 'max']
+          else
+            args += ['-cpu', 'host', '-accel', macos? ? 'hvf' : 'kvm']
+          end
+
+          if fw = @cfg.qemu_firmware(host_arch)
+            if host_arch == 'arm64'
+              args += ['-bios', fw]
+            else
+              # x86 edk2 images are code-only pflash — `-bios` refuses them
+              args += ['-drive', "if=pflash,format=raw,readonly=on,file=#{fw}"]
+            end
+          end
+          args
+        end
+
         def start_qemu(macs)
           FileUtils.mkdir_p(vm_dir)
 
-          cmd = [@cfg.qemu_binary]
-
-          # Machine type & acceleration
-          if arm64?
-            cmd += ['-M', 'virt', '-cpu', 'host', '-accel', 'hvf']
-            fw = @cfg.qemu_firmware
-            cmd += ['-bios', fw] if fw
-          else
-            cmd += ['-accel', 'kvm']
-          end
+          cmd = [qemu_binary]
+          cmd += qemu_machine_args
 
           # Resources
           cmd += ['-m', @cfg.ram.to_s, '-smp', @cfg.cpus.to_s]
@@ -462,9 +506,14 @@ module CloudModel
           # filesystem labels, never via /dev/vdX paths.
           boot_rescue = !@host.respond_to?(:vm_boot_rescue) || @host.vm_boot_rescue
 
+          # discard/detect-zeroes: writes of zeros (mkfs, mdadm) punch holes
+          # instead of materializing them in the sparse qcow2, and fstrim in
+          # the guest returns freed space to the workstation disk.
+          drive_opts = 'cache=writeback,discard=unmap,detect-zeroes=unmap'
+
           if boot_rescue
             # Rescue disk (vda) — boots Debian directly, no ISO/UEFI dance
-            cmd += ['-drive', "file=#{rescue_disk_path},if=virtio,cache=writeback,id=rescue"]
+            cmd += ['-drive', "file=#{rescue_disk_path},if=virtio,#{drive_opts},id=rescue"]
           end
 
           # System disks — empty at first, CloudModel installs Debian onto them.
@@ -474,7 +523,7 @@ module CloudModel
           # /dev/nvme*n1; virtio vd* it would skip) see real data. Bonus:
           # nvme0n1/nvme1n1 names don't shift when the rescue disk goes away.
           @host.vm_disk_paths.each_with_index do |path, i|
-            cmd += ['-drive', "file=#{path},if=none,cache=writeback,id=drive#{i}"]
+            cmd += ['-drive', "file=#{path},if=none,#{drive_opts},id=drive#{i}"]
             cmd += ['-device', "nvme,drive=drive#{i},serial=#{@host.name}-disk#{i}"]
           end
 
@@ -489,9 +538,30 @@ module CloudModel
             cmd += ['-smbios', 'type=1,serial=ds=nocloud']
           end
 
-          # NICs — user-mode NAT; first NIC forwards high port → VM:22
           primary_ip = @host.primary_address.ip
           ssh_port   = vm_ssh_port(primary_ip)
+
+          # Shared inter-VM segment (see Config#vmnet): a NIC bound to the
+          # socket_vmnet daemon so every VM — and the workstation — sit on one L2
+          # segment and reach each other over their primary_address (the tinc VPN
+          # underlay). User-mode NAT alone isolates the VMs and breaks all
+          # cross-host guest routing. socket_vmnet_client (prepended to the command
+          # below) opens the daemon socket on fd 3; QEMU attaches via socket,fd=3.
+          #
+          # Emitted FIRST so it takes the first PCI slot and the kernel names it
+          # eth0 — the external interface cloudmodel expects (primary_address,
+          # guest publics, tinc BindToInterface, firewall all target eth0). The
+          # .link files still pin names by MAC, but matching the natural PCI order
+          # avoids an eth0↔eth1 swap that systemd-udev cannot always apply.
+          use_vmnet = @cfg.vmnet && primary_ip && File.socket?(@cfg.vmnet_socket)
+          if use_vmnet
+            vmnet_mac = CloudModel::Api::Qemu.vmnet_mac(primary_ip)
+            cmd += ['-netdev', 'socket,id=vmnet,fd=3']
+            cmd += ['-device', "virtio-net-pci,netdev=vmnet,mac=#{vmnet_mac}"]
+          end
+
+          # NICs — user-mode NAT; first NAT NIC forwards high port → VM:22.
+          # With vmnet present these become eth1, eth2, … (internet + hostfwd SSH).
           macs.each_with_index do |mac, i|
             netdev = "user,id=net#{i}"
             netdev += ",hostfwd=tcp:127.0.0.1:#{ssh_port}-:22" if i == 0
@@ -516,8 +586,17 @@ module CloudModel
           cmd += ['-chardev', "socket,id=serial0,path=#{File.join(vm_dir, 'serial.sock')},server=on,wait=off,logfile=#{File.join(vm_dir, 'serial.log')}"]
           cmd += ['-serial', 'chardev:serial0']
 
-          log "Starting QEMU: #{@cfg.qemu_binary} " \
-              "(rescue: Debian, hostfwd 127.0.0.1:#{ssh_port} → VM:22#{headless ? '' : ', display on'}) ..."
+          # socket_vmnet: run QEMU through the client wrapper, which opens the
+          # daemon socket on fd 3 (referenced by `-netdev socket,fd=3` above) and
+          # execs QEMU — so the tracked pid is still QEMU's and pid handling is
+          # unchanged.
+          if use_vmnet
+            cmd = [@cfg.vmnet_client, @cfg.vmnet_socket, *cmd]
+            log "  inter-VM segment via socket_vmnet (#{@cfg.vmnet_socket})"
+          end
+
+          log "Starting QEMU: #{qemu_binary} (#{host_arch}#{cross_arch? ? ' via TCG emulation' : ''}, " \
+              "hostfwd 127.0.0.1:#{ssh_port} → VM:22#{headless ? '' : ', display on'}) ..."
           spawn_opts = { pgroup: true }
           spawn_opts.merge!(in: '/dev/null', out: qemu_log, err: qemu_log) if headless
           pid = Process.spawn(*cmd, **spawn_opts)
@@ -540,8 +619,14 @@ module CloudModel
         # while the guest is still in firmware, and such an early connection
         # is never answered nor reset — without the hard bound the very first
         # probe would block until boot_timeout expires.
+        # TCG emulation boots roughly an order of magnitude slower than
+        # HVF/KVM — give cross-arch VMs correspondingly more time.
+        def effective_boot_timeout
+          cross_arch? ? @cfg.boot_timeout * 6 : @cfg.boot_timeout
+        end
+
         def wait_for_ssh(ip)
-          deadline = Time.now + @cfg.boot_timeout
+          deadline = Time.now + effective_boot_timeout
           begin
             Timeout.timeout(15) do
               vm_ssh(ip) { |ssh| ssh.exec!('true') }
@@ -630,7 +715,9 @@ module CloudModel
           @host.system_disks    = (0...@cfg.disk_count).map { |i| "nvme#{i}n1" }
           @host.initial_root_pw = @cfg.root_password
           @host.vm_extra_nics   = stored_macs.size - 1 if stored_macs.size > 0
-          @host.arch            = arm64? ? 'arm64' : 'amd64'
+          # arch was chosen on host creation and selected the emulated
+          # machine — keep it (cloudmodel's deploy re-detects it anyway)
+          @host.arch            = host_arch
           @host.save!
         end
 

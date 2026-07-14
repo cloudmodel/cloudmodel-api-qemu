@@ -23,6 +23,7 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.2"
 
   spec.add_dependency "rails",      "~> 8.0"
-  spec.add_dependency "cloudmodel", "~> 0.4.0"
+  spec.add_dependency "cloudmodel", "~> 0.5.0"
   spec.add_dependency "net-ssh",    ">= 7.0"
+  spec.add_dependency "webrick",    ">= 1.8" # apt cache proxy daemon
 end

@@ -10,6 +10,29 @@ describe CloudModel::Api::Qemu::WorkerPatches do
     end
   end
 
+  describe 'HostWorkerPatch#init_raid_device' do
+    let(:host) do
+      double 'Host', vm_disk_paths: ['/vms/x/disk1.qcow2'],
+        system_disks: %w[nvme0n1 nvme1n1]
+    end
+    subject(:worker) do
+      described_class.install!
+      CloudModel::Workers::HostWorker.new(host).tap { |w| allow(w).to receive(:comment_sub_step) }
+    end
+
+    it 'skips the RAID initial resync on fresh sparse images' do
+      allow(host).to receive(:exec).with(/--zero-superblock/)
+      expect(host).to receive(:exec).with(%r{mdadm --create -e1 -f --assume-clean /dev/md0 --level=1 --raid-devices=2 /dev/nvme0n1p2 /dev/nvme1n1p2})
+
+      worker.init_raid_device '', {name: 'boot', device: 'md0', partition: 2}
+    end
+
+    it 'leaves already active arrays alone' do
+      expect(host).not_to receive(:exec)
+      worker.init_raid_device 'md0 : active raid1 nvme0n1p2 nvme1n1p2', {name: 'boot', device: 'md0', partition: 2}
+    end
+  end
+
   describe 'HostWorkerPatch#disk_partition_device' do
     let(:host)   { double 'Host' }
     subject(:worker) do
