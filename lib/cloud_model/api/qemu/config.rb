@@ -143,17 +143,44 @@ module CloudModel
           @vmnet.nil? ? File.exist?(vmnet_socket) : @vmnet
         end
 
-        # Path to the socket_vmnet daemon's unix socket (see {#vmnet}).
+        # Path to the socket_vmnet daemon's unix socket (see {#vmnet}). Auto-
+        # detected across Homebrew (Apple Silicon /opt/homebrew, Intel
+        # /usr/local) and distro (/var/run) locations; override to pin it.
         attr_writer :vmnet_socket
         def vmnet_socket
-          @vmnet_socket || '/opt/homebrew/var/run/socket_vmnet'
+          @vmnet_socket || first_existing_path(%w[
+            /opt/homebrew/var/run/socket_vmnet
+            /usr/local/var/run/socket_vmnet
+            /var/run/socket_vmnet
+          ])
         end
 
         # Path to the `socket_vmnet_client` helper that opens {#vmnet_socket} on
-        # fd 3 and execs QEMU with `-netdev socket,fd=3`.
+        # fd 3 and execs QEMU with `-netdev socket,fd=3`. Found on $PATH or in the
+        # usual Homebrew/distro locations; override to pin it.
         attr_writer :vmnet_client
         def vmnet_client
-          @vmnet_client || '/opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client'
+          @vmnet_client || which('socket_vmnet_client') || first_existing_path(%w[
+            /opt/homebrew/opt/socket_vmnet/bin/socket_vmnet_client
+            /usr/local/opt/socket_vmnet/bin/socket_vmnet_client
+            /usr/local/bin/socket_vmnet_client
+            /usr/bin/socket_vmnet_client
+          ])
+        end
+
+        private
+
+        # First candidate that exists, else the first (so a usable default is
+        # always returned even before socket_vmnet is installed — {#vmnet} then
+        # stays off because the socket doesn't exist).
+        def first_existing_path(candidates)
+          candidates.find { |p| File.exist?(p) } || candidates.first
+        end
+
+        # Locate an executable on $PATH (nil if not found).
+        def which(cmd)
+          ENV.fetch('PATH', '').split(File::PATH_SEPARATOR).map { |d| File.join(d, cmd) }
+             .find { |p| File.executable?(p) && !File.directory?(p) }
         end
       end
     end
