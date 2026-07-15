@@ -476,6 +476,13 @@ module CloudModel
             args += ['-cpu', 'host', '-accel', macos? ? 'hvf' : 'kvm']
           end
 
+          # RTC follows the workstation clock so the guest recovers real time
+          # when the Mac wakes from sleep (QEMU freezes the VM clock while the
+          # host sleeps, so without this the guest drifts hours behind and apt
+          # rejects "not valid yet" repo Release files). driftfix=slew smooths
+          # small catch-ups instead of hard-stepping.
+          args += ['-rtc', 'base=utc,clock=host,driftfix=slew']
+
           if fw = @cfg.qemu_firmware(host_arch)
             if host_arch == 'arm64'
               args += ['-bios', fw]
