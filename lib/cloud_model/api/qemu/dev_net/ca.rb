@@ -28,8 +28,13 @@ module CloudModel
           MARKER   = 'zones.json'
 
           # 20 years — a dev CA that never silently expires mid-project.
-          CA_YEARS   = 20
-          LEAF_YEARS = 5
+          CA_YEARS = 20
+          # Apple's TLS policy rejects server certificates valid for more than
+          # 825 days (CSSMERR_TP_CERT_SUSPENDED) — even when issued by a locally
+          # trusted root. Safari then shows "not secure" and blocks getUserMedia
+          # entirely. Chrome does not enforce this for local roots, which makes
+          # the failure look browser-specific. Stay safely under the limit.
+          LEAF_DAYS = 730
 
           attr_reader :dir
 
@@ -105,7 +110,7 @@ module CloudModel
             key  = OpenSSL::PKey::RSA.new(2048)
             # CN is just the first zone's wildcard; the SANs are what matter.
             name = OpenSSL::X509::Name.parse("/O=cloudmodel dev/CN=*.#{zones.sort.first}")
-            cert = base_cert(key.public_key, name, ca_cert.subject, LEAF_YEARS)
+            cert = base_cert(key.public_key, name, ca_cert.subject, LEAF_DAYS / 365.0)
 
             sans = zones.flat_map { |z| ["DNS:#{z}", "DNS:*.#{z}"] }.join(',')
             ef = OpenSSL::X509::ExtensionFactory.new
