@@ -18,7 +18,7 @@ Gem::Specification.new do |spec|
   spec.metadata["homepage_uri"]    = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/cloudmodel/cloudmodel-api-qemu"
 
-  spec.files = Dir["lib/**/*", "LICENSE", "README.md"]
+  spec.files = Dir["lib/**/*", "libexec/**/*", "bin/**/*", "LICENSE", "README.md"]
 
   spec.required_ruby_version = ">= 3.2"
 

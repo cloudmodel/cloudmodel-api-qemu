@@ -519,8 +519,14 @@ module CloudModel
           drive_opts = 'cache=writeback,discard=unmap,detect-zeroes=unmap'
 
           if boot_rescue
-            # Rescue disk (vda) — boots Debian directly, no ISO/UEFI dance
-            cmd += ['-drive', "file=#{rescue_disk_path},if=virtio,#{drive_opts},id=rescue"]
+            # Rescue disk — boots Debian directly, no ISO/UEFI dance. Explicit
+            # bootindex=0 forces the firmware to boot it FIRST; otherwise, once
+            # the system disks carry a grub-efi ESP, EDK2 may prefer that and boot
+            # the installed system even in rescue mode (there is no persistent
+            # NVRAM to pin the order). Attached as a virtio-blk device (not the
+            # if=virtio shorthand) so bootindex can be set.
+            cmd += ['-drive', "file=#{rescue_disk_path},if=none,#{drive_opts},id=rescue"]
+            cmd += ['-device', 'virtio-blk-pci,drive=rescue,bootindex=0']
           end
 
           # System disks — empty at first, CloudModel installs Debian onto them.
@@ -529,9 +535,12 @@ module CloudModel
           # cloudmodel's UNMODIFIED smart check_mk plugin (it scans
           # /dev/nvme*n1; virtio vd* it would skip) see real data. Bonus:
           # nvme0n1/nvme1n1 names don't shift when the rescue disk goes away.
+          # In rescue mode they get a bootindex AFTER the rescue disk.
           @host.vm_disk_paths.each_with_index do |path, i|
             cmd += ['-drive', "file=#{path},if=none,#{drive_opts},id=drive#{i}"]
-            cmd += ['-device', "nvme,drive=drive#{i},serial=#{@host.name}-disk#{i}"]
+            dev = "nvme,drive=drive#{i},serial=#{@host.name}-disk#{i}"
+            dev += ",bootindex=#{i + 1}" if boot_rescue
+            cmd += ['-device', dev]
           end
 
           if boot_rescue

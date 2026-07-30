@@ -1,0 +1,232 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# cm-dev-net-dns — a small session-scoped split-horizon DNS forwarder for the
+# QEMU dev cloud.
+#
+# For a dev deployment we want names to resolve LIVE: deploy a guest and it
+# should resolve straight away, without re-running anything. So this forwarder
+# answers in three tiers:
+#
+#   1. static overrides — the hand-pinned `additional_hosts` names (name -> IP),
+#      passed once at start (they rarely change);
+#   2. LIVE database — any other name under a configured dev zone is looked up on
+#      demand in the CloudModel::AddressResolution registry (`--mongo-*`), so
+#      freshly-deployed guests resolve immediately (answers cached briefly);
+#   3. everything else is FORWARDED to the real upstream resolvers, so unknown
+#      names under the same zone still resolve publicly instead of NXDOMAIN.
+#
+# A live answer is only served if the name is under a dev zone AND its IP falls
+# inside the dev networks (`--live-cidr`), so the DB can never make us answer for
+# something outside the dev cloud. If the `mongo` gem or the DB is unavailable,
+# tier 2 is skipped and the forwarder still serves tier 1 + forwards.
+#
+# Binds an UNPRIVILEGED loopback high port (127.0.0.1:5354 by default); the
+# platform resolver glue points the dev zones at it. The rake task spawns it
+# detached and stops it via its pidfile; each `dev:net:up` restarts it.
+
+require 'socket'
+require 'resolv'
+require 'ipaddr'
+require 'optparse'
+require 'monitor'
+
+opts = { listen: '127.0.0.1', port: 5354, upstreams: [], overrides: {}, zones: [],
+         live_cidrs: [], mongo_hosts: [], mongo_db: nil, mongo_collection: 'address_resolutions',
+         pidfile: nil, logfile: nil }
+OptionParser.new do |o|
+  o.on('--listen IP')          { |v| opts[:listen] = v }
+  o.on('--port N', Integer)    { |v| opts[:port] = v }
+  o.on('--upstream IP')        { |v| opts[:upstreams] << v }
+  o.on('--override NAME=IP')   { |v| n, ip = v.split('=', 2); opts[:overrides][n.to_s.downcase.sub(/\.\z/, '')] = ip }
+  o.on('--zone DOMAIN')        { |v| opts[:zones] << v.to_s.downcase.sub(/\.\z/, '') }
+  o.on('--live-cidr CIDR')     { |v| opts[:live_cidrs] << v }
+  o.on('--mongo-host HOSTPORT'){ |v| opts[:mongo_hosts] << v }
+  o.on('--mongo-db NAME')      { |v| opts[:mongo_db] = v }
+  o.on('--mongo-collection C') { |v| opts[:mongo_collection] = v }
+  o.on('--pidfile PATH')       { |v| opts[:pidfile] = v }
+  o.on('--logfile PATH')       { |v| opts[:logfile] = v }
+end.parse!(ARGV)
+
+abort 'cm-dev-net-dns: at least one --upstream is required' if opts[:upstreams].empty?
+
+LOG = opts[:logfile] ? File.open(opts[:logfile], 'a') : $stderr
+LOG.sync = true
+def log(msg) = LOG.puts("[#{Time.now.strftime('%Y-%m-%d %H:%M:%S')}] #{msg}")
+
+A_TYPE     = Resolv::DNS::Resource::IN::A
+AAAA_TYPE  = Resolv::DNS::Resource::IN::AAAA
+LIVE_CIDRS = opts[:live_cidrs].map { |c| IPAddr.new(c) rescue nil }.compact
+ZONES      = opts[:zones]
+
+# ── live DB resolver (tier 2) — optional, degrades gracefully ──────────────────
+class LiveResolver
+  include MonitorMixin
+  TTL = 5 # seconds; browsers spam A+AAAA, so cache both hits and misses briefly.
+
+  def initialize(hosts:, database:, collection:, zones:, cidrs:, logger:)
+    super()
+    @zones = zones
+    @cidrs = cidrs
+    @log = logger
+    @cache = {}
+    @coll = nil
+    return if hosts.empty? || database.to_s.empty?
+    require 'mongo'
+    Mongo::Logger.logger.level = Logger::FATAL
+    client = Mongo::Client.new(hosts, database: database, server_selection_timeout: 2, connect_timeout: 2)
+    @coll = client[collection]
+    @log.call "live DB resolution on #{hosts.join(',')}/#{database} (#{collection})"
+  rescue LoadError
+    @log.call 'mongo gem not available — live DB resolution disabled (static + forward only)'
+    @coll = nil
+  rescue StandardError => e
+    @log.call "live DB resolution disabled (#{e.class}: #{e.message})"
+    @coll = nil
+  end
+
+  def enabled? = !@coll.nil?
+
+  def in_zone?(name)
+    @zones.any? { |z| name == z || name.end_with?(".#{z}") }
+  end
+
+  # Returns the dev IP for a name resolved live from the registry, or nil.
+  def lookup(name)
+    return nil unless @coll && in_zone?(name)
+    cached = cache_get(name)
+    return cached[1] unless cached.nil?
+    ip = query(name)
+    ip = nil unless ip && dev_ip?(ip)
+    cache_put(name, ip)
+    ip
+  end
+
+  private
+
+  def query(name)
+    doc = @coll.find('$or' => [{ 'name' => name }, { 'alt_names' => name }]).limit(1).first
+    doc && doc['ip'].to_s
+  rescue StandardError => e
+    @log.call "live lookup error for #{name}: #{e.class}: #{e.message}"
+    nil
+  end
+
+  def dev_ip?(ip)
+    addr = IPAddr.new(ip)
+    addr.ipv4? && @cidrs.any? { |c| c.include?(addr) }
+  rescue IPAddr::Error, ArgumentError
+    false
+  end
+
+  def cache_get(name)
+    synchronize do
+      v = @cache[name]
+      return nil if v.nil? || v[0] < Time.now
+      v
+    end
+  end
+
+  def cache_put(name, ip)
+    synchronize { @cache[name] = [Time.now + TTL, ip] }
+  end
+end
+
+LIVE = LiveResolver.new(
+  hosts: opts[:mongo_hosts], database: opts[:mongo_db], collection: opts[:mongo_collection],
+  zones: ZONES, cidrs: LIVE_CIDRS, logger: method(:log)
+)
+
+# Resolve a name to a dev IPv4 via tier 1 (static) then tier 2 (live DB); nil if
+# it should be forwarded upstream.
+def resolve_dev(name, overrides)
+  overrides[name] || LIVE.lookup(name)
+end
+
+# Relay a raw DNS query to the upstream resolvers (first that answers wins).
+def forward(query, upstreams)
+  upstreams.each do |up|
+    sock = UDPSocket.new
+    begin
+      sock.send(query, 0, up, 53)
+      if IO.select([sock], nil, nil, 2.0)
+        resp, = sock.recvfrom(4096)
+        return resp
+      end
+    rescue StandardError => e
+      log "upstream #{up} error: #{e.class}: #{e.message}"
+    ensure
+      sock.close
+    end
+  end
+  nil
+end
+
+def build_response(request, name, typeclass)
+  r = Resolv::DNS::Message.new(request.id)
+  r.qr = 1
+  r.opcode = request.opcode
+  r.rd = request.rd
+  r.ra = 1
+  r.rcode = 0
+  r.add_question(name, typeclass)
+  yield r if block_given?
+  r.encode
+end
+
+server = UDPSocket.new
+# Allow immediate rebind when `dev:net:up` restarts us to load a new override set.
+server.setsockopt(Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true)
+server.bind(opts[:listen], opts[:port])
+log "listening on #{opts[:listen]}:#{opts[:port]} — #{opts[:overrides].size} static name(s), " \
+    "zones=#{ZONES.join(',')}, live=#{LIVE.enabled?}, upstreams=#{opts[:upstreams].join(',')}"
+File.write(opts[:pidfile], Process.pid.to_s) if opts[:pidfile]
+
+shutdown = proc do
+  File.delete(opts[:pidfile]) if opts[:pidfile] && File.exist?(opts[:pidfile])
+  log 'shutting down'
+  exit 0
+end
+Signal.trap('TERM', &shutdown)
+Signal.trap('INT',  &shutdown)
+
+loop do
+  begin
+    data, from = server.recvfrom(4096)
+  rescue StandardError => e
+    log "recv error: #{e.class}: #{e.message}"
+    next
+  end
+
+  # One lightweight thread per query so a slow upstream/DB never stalls the loop.
+  Thread.new(data, from) do |query, peer|
+    reply =
+      begin
+        msg = Resolv::DNS::Message.decode(query)
+        qname, typeclass = msg.question.first
+        key = qname.to_s.downcase.sub(/\.\z/, '')
+        ip  = resolve_dev(key, opts[:overrides])
+        if ip && typeclass == A_TYPE
+          log "resolve #{key} A -> #{ip}"
+          build_response(msg, qname, typeclass) { |r| r.add_answer(qname, 60, A_TYPE.new(Resolv::IPv4.create(ip))) }
+        elsif ip && typeclass == AAAA_TYPE
+          # Dev names are IPv4-only here; answer NODATA so the client uses the A
+          # record instead of leaking an AAAA lookup to public DNS.
+          log "resolve #{key} AAAA -> NODATA"
+          build_response(msg, qname, typeclass)
+        else
+          forward(query, opts[:upstreams])
+        end
+      rescue StandardError => e
+        # If we can't parse it, we can't safely override it — forward raw.
+        log "decode/handle error: #{e.class}: #{e.message} (forwarding raw)"
+        forward(query, opts[:upstreams])
+      end
+
+    begin
+      server.send(reply, 0, peer[3], peer[1]) if reply
+    rescue StandardError => e
+      log "send error: #{e.class}: #{e.message}"
+    end
+  end
+end

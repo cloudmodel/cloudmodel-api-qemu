@@ -1,0 +1,206 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# cm-dev-net-exec — the ONLY part that runs as root. Pure Ruby stdlib so it can
+# be launched via `sudo <ruby> cm-dev-net-exec ...` without bundler/Rails.
+#
+#   cm-dev-net-exec up   <plan.json>
+#   cm-dev-net-exec down <plan.json>
+#
+# Security model:
+#   * It re-validates the on-disk plan against the SAME whitelist the planner
+#     used (Validator). A plan that doesn't validate is refused — the root side
+#     never trusts the file blindly.
+#   * Every privileged action is a fixed argv array passed to Process.spawn
+#     (no shell, ever) — validated values are arguments, never interpolated into
+#     a command string, so there is no command-injection surface.
+#   * `down` is derived from the same plan and reverses each op, leaving nothing
+#     behind (status then proves it clean).
+
+require 'json'
+require 'ipaddr'
+require 'socket'
+require 'fileutils'
+require_relative File.join('..', 'lib', 'cloud_model', 'api', 'qemu', 'dev_net', 'validator')
+
+Validator = CloudModel::Api::Qemu::DevNet::Validator
+
+action = ARGV[0]
+
+# ── CA trust actions (macOS/Linux) — take a cert path, not a plan ───────────────
+# Kept separate from the routing plan: trusting a CA is its own decision with its
+# own lifecycle. The path is validated (absolute, existing, .crt, not a symlink)
+# and passed as an argv element — never a shell string.
+if %w[trust-ca untrust-ca].include?(action)
+  cert = ARGV[1].to_s
+  abort "usage: #{File.basename($PROGRAM_NAME)} #{action} <ca.crt>" if cert.empty?
+  abort "not an absolute path: #{cert}"        unless cert.start_with?('/')
+  abort "cert not found or not a file: #{cert}" unless File.file?(cert)
+  abort "refusing a symlinked cert path: #{cert}" if File.symlink?(cert)
+  abort "expected a .crt file: #{cert}"        unless cert.end_with?('.crt')
+
+  dry = ENV['CM_DEV_NET_DRY'] == '1'
+  run = lambda do |*argv|
+    puts "  + #{argv.join(' ')}"
+    next true if dry
+    system([argv.first, argv.first], *argv[1..])
+  end
+
+  darwin  = RUBY_PLATFORM.include?('darwin')
+  keychain = '/Library/Keychains/System.keychain'
+  if action == 'trust-ca'
+    if darwin
+      abort 'failed to add trusted cert' unless run.call('security', 'add-trusted-cert', '-d', '-r', 'trustRoot', '-k', keychain, cert)
+    else
+      dest = "/usr/local/share/ca-certificates/#{File.basename(cert, '.crt')}.crt"
+      FileUtils.mkdir_p('/usr/local/share/ca-certificates') unless dry
+      FileUtils.cp(cert, dest) unless dry
+      run.call('update-ca-certificates')
+    end
+    puts 'CA trusted.'
+  else
+    if darwin
+      run.call('security', 'remove-trusted-cert', '-d', cert) # tolerated if absent
+    else
+      dest = "/usr/local/share/ca-certificates/#{File.basename(cert, '.crt')}.crt"
+      File.delete(dest) if !dry && File.exist?(dest)
+      run.call('update-ca-certificates', '--fresh')
+    end
+    puts 'CA trust removed.'
+  end
+  exit 0
+end
+
+plan_path = ARGV[1]
+abort "usage: #{File.basename($PROGRAM_NAME)} up|down|trust-ca|untrust-ca <arg>" unless %w[up down].include?(action) && plan_path
+abort "plan file not found: #{plan_path}" unless File.file?(plan_path)
+
+plan = JSON.parse(File.read(plan_path))
+
+validator = Validator.new(allowed_cidrs: plan['allowed_cidrs'], scope_domains: plan['scope_domains'])
+begin
+  validator.validate_plan!(plan)
+rescue Validator::Error => e
+  abort "REFUSING to apply — plan failed re-validation as root: #{e.message}"
+end
+
+PLATFORM = plan['platform']
+DRY      = ENV['CM_DEV_NET_DRY'] == '1'
+
+# Run a fixed command as an argv array — NO shell. Aborts on failure unless the
+# op is inherently best-effort (a delete/cleanup that may legitimately be a no-op).
+def run(*argv, allow_fail: false)
+  puts "  + #{argv.join(' ')}"
+  return true if DRY
+  ok = system([argv.first, argv.first], *argv[1..])
+  abort "command failed: #{argv.join(' ')}" if !ok && !allow_fail
+  ok
+end
+
+def netmask_for(prefix)
+  IPAddr.new('255.255.255.255').mask(prefix).to_s
+end
+
+# Find the local interface that holds the given IPv4 address (used to locate the
+# socket_vmnet bridge from its gateway IP — no shell, no guessing).
+def iface_holding(ip)
+  Socket.getifaddrs.find { |i| i.addr&.ipv4? && i.addr.ip_address == ip }&.name
+end
+
+def resolver_path(domain) = File.join('/etc/resolver', domain)
+
+def flush_darwin_dns
+  run('dscacheutil', '-flushcache', allow_fail: true)
+  run('killall', '-HUP', 'mDNSResponder', allow_fail: true)
+end
+
+def require_systemd_resolved!
+  return if DRY
+  ok = system('systemctl', 'is-active', '--quiet', 'systemd-resolved')
+  return if ok
+  warn <<~MSG
+    systemd-resolved is not active — this tool's Linux DNS path requires it.
+    Apply the routing manually, and point your resolver at the forwarder yourself, e.g.:
+      resolvectl dns <link> 127.0.0.1:5354
+      resolvectl domain <link> ~<your-dev-domain>
+  MSG
+  abort 'aborting: systemd-resolved unavailable'
+end
+
+# ── op appliers (up) ───────────────────────────────────────────────────────────
+def up_vmnet_join(op)
+  iface = iface_holding(op['vmnet_gw'])
+  abort "socket_vmnet bridge (interface holding #{op['vmnet_gw']}) not found — is the daemon running?" \
+    unless iface || DRY
+  iface ||= '<vmnet-bridge>'
+  run('ifconfig', iface, 'alias', op['ip'], netmask_for(op['prefix']))
+end
+
+def up_route_add(op)
+  run('route', '-n', 'delete', '-net', op['net'], allow_fail: true)
+  run('route', '-n', 'add', '-net', op['net'], op['via'])
+end
+
+def up_ip_route_add(op)
+  run('ip', 'route', 'replace', op['net'], 'via', op['via'])
+end
+
+def up_resolver_file(op)
+  FileUtils.mkdir_p('/etc/resolver') unless DRY
+  path = resolver_path(op['domain'])
+  puts "  + write #{path} (nameserver #{op['nameserver']}, port #{op['port']})"
+  File.write(path, "nameserver #{op['nameserver']}\nport #{op['port']}\n") unless DRY
+  flush_darwin_dns
+end
+
+def up_resolvectl(op)
+  link = op['link']
+  run('ip', 'link', 'add', link, 'type', 'dummy', allow_fail: true)
+  run('ip', 'link', 'set', link, 'up')
+  run('resolvectl', 'dns', link, "#{op['nameserver']}:#{op['port']}")
+  run('resolvectl', 'domain', link, "~#{op['domain']}")
+end
+
+# ── op reversers (down) ────────────────────────────────────────────────────────
+def down_vmnet_join(op)
+  iface = iface_holding(op['ip']) || iface_holding(op['vmnet_gw'])
+  return unless iface
+  run('ifconfig', iface, '-alias', op['ip'], allow_fail: true)
+end
+
+def down_route_add(op)
+  run('route', '-n', 'delete', '-net', op['net'], op['via'], allow_fail: true)
+end
+
+def down_ip_route_add(op)
+  run('ip', 'route', 'del', op['net'], 'via', op['via'], allow_fail: true)
+end
+
+def down_resolver_file(op)
+  path = resolver_path(op['domain'])
+  if File.exist?(path)
+    puts "  - rm #{path}"
+    File.delete(path) unless DRY
+  end
+  flush_darwin_dns
+end
+
+def down_resolvectl(op)
+  run('resolvectl', 'revert', op['link'], allow_fail: true)
+  run('ip', 'link', 'del', op['link'], allow_fail: true)
+end
+
+# ── drive ──────────────────────────────────────────────────────────────────────
+ops = plan['ops']
+require_systemd_resolved! if PLATFORM != 'darwin' && ops.any? { |o| o['op'] == 'resolvectl' }
+
+puts "#{action} (#{PLATFORM}) — #{ops.size} operation(s)#{DRY ? ' [DRY RUN]' : ''}:"
+
+if action == 'up'
+  ops.each { |op| send("up_#{op['op']}", op) }
+else
+  # Reverse order so we tear down in the opposite sequence we built up.
+  ops.reverse_each { |op| send("down_#{op['op']}", op) }
+end
+
+puts "#{action} complete."
