@@ -67,6 +67,86 @@ describe CloudModel::Api::Qemu::Server do
     end
   end
 
+  describe '#restart' do
+    it 'powers off gracefully and starts again' do
+      allow(server).to receive(:running?).and_return(true)
+      expect(server).to receive(:stop).with(timeout: 90).and_return(true)
+      expect(server).not_to receive(:kill)
+      expect(server).to receive(:start)
+      server.restart
+    end
+
+    it 'kills only when the guest ignores the power-off' do
+      allow(server).to receive(:running?).and_return(true)
+      allow(server).to receive(:stop).and_return(false)
+      expect(server).to receive(:kill).ordered
+      expect(server).to receive(:start).ordered
+      server.restart(timeout: 5)
+    end
+
+    it 'just starts a stopped VM' do
+      allow(server).to receive(:running?).and_return(false)
+      expect(server).not_to receive(:stop)
+      expect(server).to receive(:start)
+      server.restart
+    end
+  end
+
+  describe '#healthy?' do
+    it 'is false for a VM that is not running' do
+      allow(server).to receive(:running?).and_return(false)
+      expect(server).not_to receive(:vm_ssh)
+      expect(server.healthy?).to be false
+    end
+
+    it 'is true when the guest answers SSH' do
+      allow(server).to receive(:running?).and_return(true)
+      ssh = double 'ssh', exec!: ''
+      expect(server).to receive(:vm_ssh).with('10.66.0.3').and_yield(ssh)
+      expect(server.healthy?).to be true
+    end
+
+    it 'is false when SSH fails or hangs (hostfwd accepts TCP even while the guest is dead)' do
+      allow(server).to receive(:running?).and_return(true)
+      allow(server).to receive(:vm_ssh).and_raise(Errno::ECONNRESET)
+      expect(server.healthy?).to be false
+      allow(server).to receive(:vm_ssh) { sleep 2 }
+      expect(server.healthy?(timeout: 0.2)).to be false
+    end
+  end
+
+  describe '#repair_zfs!' do
+    let(:ssh) { double 'ssh' }
+
+    before do
+      allow(server).to receive(:running?).and_return(true)
+      allow(server).to receive(:kill)
+      allow(server).to receive(:start)
+      allow(server).to receive(:wait_for_ssh)
+      allow(server).to receive(:log)
+      allow(host).to receive(:update_attributes)
+    end
+
+    it 'rescue-boots, enables zfs_recover on the installed root, boots the system and scrubs' do
+      expect(host).to receive(:update_attributes).with(vm_boot_rescue: true).ordered
+      expect(server).to receive(:vm_ssh).with('10.66.0.3').ordered.and_yield(ssh)
+      expect(ssh).to receive(:exec!).with(/zfs_recover=1.*REPAIR OK/m).and_return("...\nREPAIR OK: root=/dev/md124 boot=/dev/md125 pool=guests\n")
+      expect(host).to receive(:update_attributes).with(vm_boot_rescue: false).ordered
+      expect(server).to receive(:vm_ssh).with('10.66.0.3').ordered.and_yield(ssh)
+      expect(ssh).to receive(:exec!).with(/zpool scrub guests/).and_return('scrub started')
+
+      expect(server.repair_zfs!).to be true
+    end
+
+    it 'leaves the VM in rescue mode and raises when the repair script fails' do
+      allow(server).to receive(:vm_ssh).and_yield(ssh)
+      allow(ssh).to receive(:exec!).and_return('REPAIR FAILED: no /boot array with grub.cfg')
+      expect(host).not_to receive(:update_attributes).with(vm_boot_rescue: false)
+
+      expect { server.repair_zfs! }.to raise_error(/Repair failed/)
+    end
+  end
+
   describe '#status' do
     it 'reports name, ip, ssh port and disks' do
       status = server.status

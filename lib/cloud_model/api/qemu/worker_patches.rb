@@ -24,6 +24,75 @@ module CloudModel
           CloudModel::Workers::HostWorker.prepend HostWorkerPatch unless CloudModel::Workers::HostWorker < HostWorkerPatch
           CloudModel::Workers::HostTemplateWorker.prepend HostTemplateWorkerPatch unless CloudModel::Workers::HostTemplateWorker < HostTemplateWorkerPatch
           CloudModel::Host.prepend HostPatch unless CloudModel::Host < HostPatch
+          CloudModel::Workers::GuestWorker.prepend GuestWorkerPatch unless CloudModel::Workers::GuestWorker < GuestWorkerPatch
+        end
+
+        # Makes the local dev-net names resolvable and its CA trusted *inside*
+        # every guest, so a guest service can already reach a sibling guest by
+        # its *.<zone> name over verified TLS while its own config is written —
+        # e.g. an OIDC consumer that fetches a discovery doc during deploy.
+        #
+        # This runs at the top of config_services (before the per-service loop),
+        # because cloudmodel writes /etc/hosts only later in config_network,
+        # which is too late for services provisioned in the loop. config_network
+        # re-renders /etc/hosts afterwards; it keeps the same additional_hosts
+        # entries, so the runtime file is identical.
+        #
+        # Dev-only and self-disabling: the CA step is skipped when the CA file is
+        # absent (real clouds), and nothing here ever fails a deploy.
+        module GuestWorkerPatch
+          def config_services
+            prime_dev_net_trust
+            super
+          end
+
+          # LXD re-applies its baked /etc/hosts image template when it first
+          # instantiates the container, clobbering the additional_hosts written
+          # during config. That template only fires on create/copy (not plain
+          # start), so re-adding the names into the now-running container makes
+          # them stick across restarts — needed so the guest's own services can
+          # resolve sibling *.<zone> names at runtime (e.g. an OIDC token
+          # exchange), not just during deploy.
+          def start_lxd_container
+            super
+            add_dev_net_hosts_to_running_container
+          end
+
+          private
+
+          def prime_dev_net_trust
+            guest.deploy_path = "#{@lxc.mountpoint}/rootfs"
+            # dev names → /etc/hosts (reuses the stock template, which renders
+            # CloudModel.config.additional_hosts) so services provisioned during
+            # config_services can already resolve them
+            render_to_remote "/cloud_model/guest/etc/hosts", "#{guest.deploy_path}/etc/hosts", container_name: @lxc.name
+            install_dev_net_ca
+          rescue => e
+            Rails.logger.warn "cloudmodel-api-qemu: dev-net trust priming skipped: #{e.message}"
+          end
+
+          def add_dev_net_hosts_to_running_container
+            entries = (CloudModel.config.additional_hosts || {}).reject { |name, ip| name.to_s.strip.empty? || ip.to_s.strip.empty? }
+            return if entries.empty?
+
+            script = entries.map do |name, ip|
+              line = "#{ip} #{name}"
+              "grep -qxF #{line.shellescape} /etc/hosts || echo #{line.shellescape} >> /etc/hosts"
+            end.join(' ; ')
+            host.exec "/usr/bin/lxc exec #{@lxc.name.shellescape} -- sh -c #{script.shellescape}"
+          rescue => e
+            Rails.logger.warn "cloudmodel-api-qemu: runtime /etc/hosts update skipped: #{e.message}"
+          end
+
+          def install_dev_net_ca
+            ca_path = File.join(CloudModel.config.api.qemu.vm_dir, 'dev-net-ca', 'ca.crt')
+            return unless File.exist?(ca_path)
+
+            dest_dir = "#{guest.deploy_path}/usr/local/share/ca-certificates"
+            mkdir_p dest_dir
+            host.sftp.file.open("#{dest_dir}/cloudmodel-dev-ca.crt", 'w') { |f| f.write File.read(ca_path) }
+            chroot guest.deploy_path, 'update-ca-certificates'
+          end
         end
 
         module HostPatch
@@ -255,6 +324,8 @@ module CloudModel
             comment_sub_step 'Copy kernel and grub to /boot'
             chroot root, "cd /kernel; tar cf - * | ( cd /boot; tar xfp -)"
 
+            configure_vm_zfs_recovery root
+
             comment_sub_step 'Setup grub bootloader (UEFI)'
             chroot! root, "mdadm --detail --scan >> /etc/mdadm/mdadm.conf", "Failed to update mdadm.conf"
             chroot! root, "update-initramfs -u", "Failed to update initram"
@@ -282,6 +353,19 @@ module CloudModel
           # guest off, detach rescue disk + seed, and start from the system
           # disks instead.  The installed sshd only allows key auth, so
           # initial_root_pw is cleared — CloudModel switches to key-based SSH.
+          # Dev VMs get hard power-offs (Mac sleep, kills); the nested ZFS pool
+          # then occasionally fails its import with a panic that blocks the
+          # whole boot. zfs_recover turns that into a warning so the host comes
+          # up and can scrub. Set via modprobe.d AND the kernel command line
+          # (the pool may be imported from the initramfs); grub.cfg regenerated
+          # here because /boot is populated by now.
+          def configure_vm_zfs_recovery root
+            comment_sub_step 'Enable zfs_recover (dev VM: survive pool import panics)'
+            @host.exec! "printf 'options zfs zfs_recover=1\\n' > #{root}/etc/modprobe.d/zfs-recover.conf", 'Failed to write zfs-recover.conf'
+            @host.exec! "grep -q 'zfs.zfs_recover=1' #{root}/etc/default/grub || sed -i 's/^GRUB_CMDLINE_LINUX=\"\\(.*\\)\"/GRUB_CMDLINE_LINUX=\"\\1 zfs.zfs_recover=1\"/' #{root}/etc/default/grub", 'Failed to add zfs_recover to the kernel command line'
+            chroot! root, 'update-grub', 'Failed to regenerate grub.cfg'
+          end
+
           def vm_boot_installed_system
             comment_sub_step 'Boot installed system (VM: detach rescue disk)'
             @host.update_attribute :deploy_state, :booting

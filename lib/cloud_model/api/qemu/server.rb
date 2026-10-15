@@ -121,6 +121,95 @@ module CloudModel
           FileUtils.rm_f(pid_path)
         end
 
+        # Graceful restart: ACPI power-off first (bounded), the hard kill only
+        # when the guest does not shut down in time, then start again. Killing
+        # a VM mid-transaction is what corrupts the nested ZFS pool; this is
+        # the way to bounce a VM that misbehaves.
+        def restart(timeout: 90)
+          if running? && !stop(timeout: timeout)
+            log "ACPI power-off did not finish in #{timeout}s — killing"
+            kill
+          end
+          start
+        end
+
+        # The only honest "it runs" signal: the hostfwd port accepts TCP even
+        # while the guest is still booting (or hung), so ask the guest's sshd.
+        def healthy?(timeout: 10)
+          return false unless running?
+          ip = @host.primary_address.ip
+          Timeout.timeout(timeout) { vm_ssh(ip) { |ssh| ssh.exec!('true') } }
+          true
+        rescue StandardError, Timeout::Error
+          false
+        end
+
+        # Repairs a VM whose installed system no longer boots because the ZFS
+        # pool import panics ("adding existent segment to range tree" after a
+        # hard power-off): boots the rescue disk, mounts the installed root and
+        # /boot, enables zfs_recover there (modprobe.d + kernel command line,
+        # grub.cfg regenerated), boots the installed system again and starts a
+        # scrub. The pool then imports with warnings instead of hanging.
+        def repair_zfs!
+          ip = @host.primary_address.ip
+          log "Booting the rescue system…"
+          kill if running?
+          @host.update_attributes vm_boot_rescue: true
+          start
+          wait_for_ssh(ip)
+
+          log "Enabling zfs_recover on the installed root…"
+          out = vm_ssh(ip) { |ssh| ssh.exec!(REPAIR_ZFS_SCRIPT.gsub('__POOL__', ZFS_GUEST_POOL)) }.to_s
+          log out.lines.last(2).join.strip
+          raise "Repair failed:\n#{out}" unless out.include?('REPAIR OK')
+
+          log "Booting the installed system…"
+          kill
+          @host.update_attributes vm_boot_rescue: false
+          start
+          wait_for_ssh(ip)
+          log vm_ssh(ip) { |ssh| ssh.exec!("zpool status -x #{ZFS_GUEST_POOL} 2>&1; zpool scrub #{ZFS_GUEST_POOL} 2>&1 && echo 'scrub started'") }.to_s.strip
+          true
+        end
+
+        # cloudmodel's guest pool on every host (see guest_zpool.service).
+        ZFS_GUEST_POOL = 'guests'.freeze
+
+        # Runs inside the rescue system. Finds /boot by its grub.cfg, the
+        # installed root by the root=UUID grub boots (hosts have A/B root
+        # slots), and never touches the pool itself.
+        REPAIR_ZFS_SCRIPT = <<~'SH'
+          set -e
+          mdadm --assemble --scan >/dev/null 2>&1 || true
+          mkdir -p /mnt/repair /mnt/repairboot
+          boot=""
+          for md in /dev/md[0-9]*; do
+            [ -b "$md" ] || continue
+            mdadm --readwrite "$md" >/dev/null 2>&1 || true
+            if mount -o ro "$md" /mnt/repairboot 2>/dev/null; then
+              if [ -f /mnt/repairboot/grub/grub.cfg ]; then boot="$md"; umount /mnt/repairboot; break; fi
+              umount /mnt/repairboot
+            fi
+          done
+          [ -n "$boot" ] || { echo "REPAIR FAILED: no /boot array with grub.cfg"; exit 1; }
+          mount -o ro "$boot" /mnt/repairboot
+          uuid=$(grep -o 'root=UUID=[^ ]*' /mnt/repairboot/grub/grub.cfg | head -1 | cut -d= -f3)
+          umount /mnt/repairboot
+          root=$(blkid -U "$uuid" 2>/dev/null || true)
+          [ -n "$root" ] || { echo "REPAIR FAILED: root filesystem $uuid not found"; exit 1; }
+          mount "$root" /mnt/repair
+          mount "$boot" /mnt/repair/boot
+          printf 'options zfs zfs_recover=1
+' > /mnt/repair/etc/modprobe.d/zfs-recover.conf
+          grep -q 'zfs.zfs_recover=1' /mnt/repair/etc/default/grub || sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX=" zfs.zfs_recover=1"/' /mnt/repair/etc/default/grub
+          for d in dev proc sys; do mount --bind /$d /mnt/repair/$d; done
+          chroot /mnt/repair update-grub >/dev/null 2>&1 || { echo "REPAIR FAILED: update-grub"; exit 1; }
+          grep -q 'zfs.zfs_recover=1' /mnt/repair/boot/grub/grub.cfg || { echo "REPAIR FAILED: grub.cfg lacks zfs_recover"; exit 1; }
+          for d in sys proc dev boot; do umount /mnt/repair/$d; done
+          umount /mnt/repair; sync
+          echo "REPAIR OK: root=$root boot=$boot pool=__POOL__"
+        SH
+
         def destroy
           kill if running?
           ip = @host.primary_address&.ip

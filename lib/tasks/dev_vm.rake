@@ -112,9 +112,72 @@ namespace :dev do
       find_vm_host(args[:name]).stop_vm!
     end
 
-    desc "Force-kill a VM (like pulling the power)"
+    desc "Force-kill a VM (like pulling the power) — prefer dev:vm:restart, a hard kill is what corrupts the nested ZFS pool"
     task :kill, [:name] => [:environment] do |_, args|
       find_vm_host(args[:name]).kill_vm!
+    end
+
+    desc "Graceful restart: ACPI power-off (TIMEOUT=90s), kill only if the guest does not shut down, then start"
+    task :restart, [:name] => [:environment] do |_, args|
+      find_vm_host(args[:name]).restart_vm! timeout: ENV.fetch('TIMEOUT', 90).to_i
+    end
+
+    desc "Rescue-boot a VM whose installed system hangs on the ZFS pool import (panic 'adding existent segment to range tree'), enable zfs_recover on it, boot it again and scrub"
+    task :repair, [:name] => [:environment] do |_, args|
+      find_vm_host(args[:name]).repair_vm_zfs!
+    end
+
+    # VMs that were running when stop_all shut them down — start_all brings
+    # exactly those back.
+    def autostart_list_path
+      File.join(CloudModel.config.api.qemu.vm_dir, 'autostart.json')
+    end
+
+    desc "Gracefully stop all running dev VMs and remember them for start_all"
+    task stop_all: :environment do
+      hosts = running_vm_hosts
+      require 'json'
+      File.write(autostart_list_path, JSON.generate(hosts.map(&:name)))
+      puts hosts.empty? ? "No running VMs." : "Stopping #{hosts.size} VM(s)…"
+      hosts.each do |h|
+        ok = h.stop_vm!
+        unless ok
+          puts "  #{h.name} did not power off — killing"
+          h.kill_vm!
+        end
+        puts "  ■ #{h.name}"
+      end
+    end
+
+    desc "Start the VMs stop_all shut down (or NAMES=a,b)"
+    task start_all: :environment do
+      require 'json'
+      names = ENV['NAMES'].to_s.split(',').map(&:strip).reject(&:empty?)
+      names = (JSON.parse(File.read(autostart_list_path)) rescue []) if names.empty?
+      puts "Nothing to start." if names.empty?
+      names.each do |name|
+        host = CloudModel::Host.where(name: name).first
+        next puts("  ? #{name} (no such host)") unless host
+        host.start_vm!
+        puts "  ▶ #{name}"
+      end
+    end
+
+    desc "Check every running VM answers SSH (WAIT=120s grace); restart the ones that don't instead of leaving them hung"
+    task verify: :environment do
+      hosts = running_vm_hosts
+      grace = ENV.fetch('WAIT', 120).to_i
+      deadline = Time.now + grace
+      pending = hosts.dup
+      until pending.empty? || Time.now > deadline
+        pending.reject! { |h| h.vm_healthy?(timeout: 8) && (puts("  ✓ #{h.name}"); true) }
+        sleep 10 unless pending.empty?
+      end
+      pending.each do |h|
+        puts "  ✗ #{h.name} does not answer SSH after #{grace}s — graceful restart"
+        h.restart_vm!
+      end
+      puts "No running VMs." if hosts.empty?
     end
 
     desc "Destroy a VM's disks and state files (keeps the Host document)"
@@ -201,7 +264,9 @@ namespace :dev do
       rubybin = File.dirname(ruby)
       hook = ->(task) { "#!/bin/sh\nexport PATH=#{rubybin}:$PATH\ncd #{app} && bundle exec rake #{task} >> #{dir}/sleep-guard.log 2>&1\n" }
       File.write(sleep_sh, hook.call('dev:vm:pause_all'))
-      File.write(wake_sh,  hook.call('dev:vm:resume_all'))
+      # resume, then make sure every VM really came back; a VM the freeze
+      # wedged is restarted gracefully rather than left hung (and killed later)
+      File.write(wake_sh,  hook.call('dev:vm:resume_all dev:vm:verify'))
       File.chmod(0o755, sleep_sh); File.chmod(0o755, wake_sh)
 
       have_sw = !`which sleepwatcher 2>/dev/null`.strip.empty?

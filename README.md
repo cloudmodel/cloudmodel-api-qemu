@@ -97,7 +97,11 @@ rake dev:create_vm_host[name,0,amd64] # explicit architecture
 | `rake dev:vm:list` | All hosts with VM state |
 | `rake dev:vm:start[name]` | Start a stopped VM |
 | `rake dev:vm:stop[name]` | Graceful ACPI power-off |
-| `rake dev:vm:kill[name]` | Hard kill (pull the power — see [recovery notes](#troubleshooting--recovery)) |
+| `rake dev:vm:restart[name]` | Graceful restart: ACPI power-off, kill only after `TIMEOUT` (90s), start |
+| `rake dev:vm:kill[name]` | Hard kill (pull the power — see [recovery notes](#troubleshooting--recovery)); prefer `restart` |
+| `rake dev:vm:stop_all` / `start_all` | Gracefully stop every running VM and bring exactly those back later |
+| `rake dev:vm:verify` | Every running VM must answer SSH within `WAIT` (120s); a hung one is restarted gracefully |
+| `rake dev:vm:repair[name]` | Rescue-boot a VM whose boot hangs on the ZFS pool import, enable `zfs_recover`, boot and scrub |
 | `rake dev:vm:destroy[name]` | Remove disks/state, keep the Host document |
 | `rake dev:vm:purge[name]` | Destroy + delete the Host document |
 | `rake dev:vm:ssh[name]` | Print the SSH command |
@@ -282,7 +286,17 @@ brew services start sleepwatcher
 
 The generated hooks pin the app's Ruby `bin` on `PATH` so `bundle` resolves
 inside sleepwatcher's minimal launchd environment. Once enabled: Mac sleeps →
-VMs pause; Mac wakes → VMs resume. No more mid-I/O freeze.
+VMs pause; Mac wakes → VMs resume, then `dev:vm:verify` restarts any VM the
+freeze left hung — gracefully, so the pool is never killed mid-transaction.
+
+**If a VM's boot hangs on the pool import** (serial console stops after
+"Loading initial ramdisk", the VGA console shows `PANIC: zfs: adding existent
+segment to range tree`, then `zpool` / `txg_sync` hung-task messages): the
+pool's space maps were damaged by an earlier hard power-off. `rake
+dev:vm:repair[name]` rescue-boots the VM, enables `zfs_recover=1` on the
+installed system (modprobe.d + kernel command line) so the import proceeds
+with warnings, boots it again and starts a scrub. Hosts deployed by this
+plugin get `zfs_recover=1` from the start.
 
 ## Troubleshooting & recovery
 
