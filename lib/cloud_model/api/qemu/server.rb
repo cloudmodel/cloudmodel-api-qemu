@@ -199,9 +199,8 @@ module CloudModel
           [ -n "$root" ] || { echo "REPAIR FAILED: root filesystem $uuid not found"; exit 1; }
           mount "$root" /mnt/repair
           mount "$boot" /mnt/repair/boot
-          printf 'options zfs zfs_recover=1
-' > /mnt/repair/etc/modprobe.d/zfs-recover.conf
-          grep -q 'zfs.zfs_recover=1' /mnt/repair/etc/default/grub || sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX=" zfs.zfs_recover=1"/' /mnt/repair/etc/default/grub
+          printf 'options zfs zfs_recover=1\n' > /mnt/repair/etc/modprobe.d/zfs-recover.conf
+          grep -q 'zfs.zfs_recover=1' /mnt/repair/etc/default/grub || sed -i 's/^GRUB_CMDLINE_LINUX="\(.*\)"/GRUB_CMDLINE_LINUX="\1 zfs.zfs_recover=1"/\' /mnt/repair/etc/default/grub
           for d in dev proc sys; do mount --bind /$d /mnt/repair/$d; done
           chroot /mnt/repair update-grub >/dev/null 2>&1 || { echo "REPAIR FAILED: update-grub"; exit 1; }
           grep -q 'zfs.zfs_recover=1' /mnt/repair/boot/grub/grub.cfg || { echo "REPAIR FAILED: grub.cfg lacks zfs_recover"; exit 1; }

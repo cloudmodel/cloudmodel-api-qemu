@@ -115,6 +115,16 @@ describe CloudModel::Api::Qemu::Server do
     end
   end
 
+  describe 'REPAIR_ZFS_SCRIPT' do
+    it 'is plain shell text: real backslash escapes, no control bytes (a \\1 once became SOH)' do
+      script = described_class::REPAIR_ZFS_SCRIPT
+      expect(script).not_to match(/[\x00-\x08\x0b-\x1f]/)
+      expect(script).to include('GRUB_CMDLINE_LINUX="\\1 zfs.zfs_recover=1"')
+      expect(script).to include("printf 'options zfs zfs_recover=1\\n'")
+      expect(script).to include('update-grub')
+    end
+  end
+
   describe '#repair_zfs!' do
     let(:ssh) { double 'ssh' }
 

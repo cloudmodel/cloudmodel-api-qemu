@@ -17,10 +17,11 @@ describe CloudModel::Api::Qemu::WorkerPatches do
       CloudModel::Workers::HostWorker.new(host).tap { |w| allow(w).to receive(:comment_sub_step) }
     end
 
-    it 'sets zfs_recover via modprobe.d and the kernel command line, then regenerates grub.cfg' do
+    it 'sets zfs_recover via modprobe.d and the kernel command line' do
       expect(host).to receive(:exec!).with("printf 'options zfs zfs_recover=1\\n' > /mnt/root/etc/modprobe.d/zfs-recover.conf", anything).ordered
       expect(host).to receive(:exec!).with(/grep -q 'zfs.zfs_recover=1' \/mnt\/root\/etc\/default\/grub \|\| sed -i .*GRUB_CMDLINE_LINUX.* zfs.zfs_recover=1/, anything).ordered
-      expect(worker).to receive(:chroot!).with('/mnt/root', 'update-grub', anything).ordered
+      # grub.cfg comes from the grub-mkconfig that boot_deploy_root runs afterwards
+      expect(worker).not_to receive(:chroot!).with(anything, 'update-grub', anything)
 
       worker.configure_vm_zfs_recovery '/mnt/root'
     end
